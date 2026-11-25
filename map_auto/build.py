@@ -283,16 +283,50 @@ def save(out,city,grid,report):
     for k,v in COLORS.items(): palette[k]=[int(v[i:i+2],16) for i in (1,3,5)]
     Image.fromarray(palette[grid]).save(out/(name+'.png'))
 
+CITY_LIST_URL = 'https://raw.githubusercontent.com/leo1109k-7063/mapaditer/main/ctlist.html'
+
+def parse_cities(s, is_json=False):
+    if is_json:
+        cities=json5.loads(s)
+    else:
+        m=re.search(r'\b(?:const|let|var)\s+citiesData\s*=\s*(\[.*?\])\s*;',s,re.S)
+        if not m: raise ValueError('citiesData 배열 없음 (Excel 프레임 HTML일 수 있음)')
+        cities=json5.loads(m.group(1))
+    if not isinstance(cities,list) or not cities or any(not isinstance(c,dict) or not c.get('code') or not c.get('name') for c in cities):
+        raise ValueError('도시 목록 형식 오류 또는 빈 목록')
+    return cities
+
 def load_cities(path):
-    s=path.read_text(encoding='utf-8-sig')
-    if path.suffix=='.json': return json5.loads(s)
-    m=re.search(r'\b(?:const|let|var)\s+citiesData\s*=\s*(\[.*?\])\s*;',s,re.S)
-    if not m: raise RuntimeError('ctlist.html의 citiesData 배열을 읽을 수 없음')
-    return json5.loads(m.group(1))
+    path=Path(path)
+    try:
+        cities=parse_cities(path.read_text(encoding='utf-8-sig'),path.suffix.lower()=='.json')
+        print(f'CITY LIST: {path} ({len(cities)} cities)',flush=True)
+        return cities
+    except (OSError,ValueError) as ex:
+        if path.resolve()!=(ROOT/'ctlist.html').resolve(): raise
+        print(f'LOCAL CITY LIST INVALID: {ex}; fetching original repository',flush=True)
+    r=SESSION.get(CITY_LIST_URL,timeout=30); r.raise_for_status()
+    cities=parse_cities(r.content.decode('utf-8-sig'))
+    print(f'CITY LIST: {CITY_LIST_URL} ({len(cities)} cities)',flush=True)
+    return cities
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--cities',type=Path,default=ROOT/'ctlist.html'); p.add_argument('--codes',nargs='*'); p.add_argument('--limit',type=int,default=3); p.add_argument('--km',type=float,default=25); p.add_argument('--out',type=Path,default=ROOT/'generated_maps'); p.add_argument('--retry',action='store_true'); p.add_argument('--allow-no-dem',action='store_true'); a=p.parse_args()
-    cities=load_cities(a.cities); failures=0; count=0
+    p=argparse.ArgumentParser(); p.add_argument('--cities',type=Path,default=ROOT/'ctlist.html'); p.add_argument('--codes',nargs='*'); p.add_argument('--limit',type=int,default=3); p.add_argument('--km',type=float,default=25); p.add_argument('--out',type=Path,default=ROOT/'generated_maps'); p.add_argument('--retry',action='store_true'); p.add_argument('--allow-no-dem',action='store_true'); p.add_argument('--list-cities',action='store_true'); a=p.parse_args()
+    try:
+        cities=load_cities(a.cities)
+        if a.codes:
+            unknown=set(a.codes)-{str(c['code']) for c in cities}
+            if unknown: raise ValueError('도시 목록에 없는 코드: '+', '.join(sorted(unknown)))
+        if a.list_cities:
+            for c in cities: print(c['code'],c['name'],c.get('country',''))
+            return 0
+        if a.limit<1 or a.km<=0: raise ValueError('limit 및 km는 양수여야 함')
+    except Exception as ex:
+        a.out.mkdir(parents=True,exist_ok=True)
+        (a.out/'city-list.error.json').write_text(json.dumps({'stage':'city_list','error':str(ex),'source':str(a.cities),'fallback':CITY_LIST_URL},ensure_ascii=False,indent=2),encoding='utf-8')
+        print('CITY LIST FAILED:',ex,flush=True)
+        return 1
+    failures=0; count=0
     for city in cities:
         code=str(city['code']);
         if not re.fullmatch(r'[\w-]+',code): print('unsafe code skipped:',code); continue
