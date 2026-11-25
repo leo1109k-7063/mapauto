@@ -1,0 +1,48 @@
+name: Generate city maps (review drafts)
+on:
+  workflow_dispatch:
+    inputs:
+      codes:
+        description: 'City codes, space-separated; blank = first unfinished cities'
+        required: false
+        default: ''
+      km:
+        description: 'Default map side in km'
+        default: '25'
+      limit:
+        description: 'Maximum cities per run (1–5 recommended)'
+        default: '3'
+permissions:
+  contents: read
+concurrency:
+  group: city-maps
+  cancel-in-progress: false
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: .map-cache
+          key: map-cache-${{ github.run_id }}
+          restore-keys: map-cache-
+      - run: pip install -r map_auto/requirements.txt
+      - name: Build maps
+        env:
+          CODES: ${{ inputs.codes }}
+          KM: ${{ inputs.km }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          read -r -a codes <<< "$CODES"
+          python map_auto/build.py --km "$KM" --limit "$LIMIT" --codes "${codes[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: city-map-drafts
+          path: generated_maps/
+          if-no-files-found: warn
