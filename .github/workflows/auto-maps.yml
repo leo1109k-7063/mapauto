@@ -1,17 +1,22 @@
-name: Generate city maps (review drafts)
+name: Generate city maps (Gemini AI)
 on:
   workflow_dispatch:
     inputs:
       codes:
-        description: 'City codes, space-separated; blank = first unfinished cities'
-        required: false
-        default: ''
+        description: 'City codes, space-separated'
+        default: 'SEO'
       km:
-        description: 'Default map side in km'
+        description: 'Map side in km'
         default: '25'
       limit:
-        description: 'Maximum cities per run (1–5 recommended)'
+        description: 'Maximum cities (1–10)'
+        default: '1'
+      rounds:
+        description: 'AI draft/review rounds (1–3)'
         default: '3'
+      model:
+        description: 'Gemini API model ID'
+        default: 'gemini-2.5-flash'
 permissions:
   contents: read
 concurrency:
@@ -29,17 +34,22 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .map-cache
-          key: map-cache-${{ github.run_id }}
-          restore-keys: map-cache-
+          key: map-ai-cache-${{ github.run_id }}
+          restore-keys: |
+            map-ai-cache-
+            map-cache-
       - run: pip install -r map_auto/requirements.txt
-      - name: Build maps
+      - name: Build with Gemini
         env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ inputs.model }}
           CODES: ${{ inputs.codes }}
           KM: ${{ inputs.km }}
           LIMIT: ${{ inputs.limit }}
+          ROUNDS: ${{ inputs.rounds }}
         run: |
           read -r -a codes <<< "$CODES"
-          python map_auto/build.py --km "$KM" --limit "$LIMIT" --codes "${codes[@]}"
+          python map_auto/ai_agent.py --km "$KM" --limit "$LIMIT" --rounds "$ROUNDS" --codes "${codes[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
