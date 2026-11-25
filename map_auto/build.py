@@ -52,17 +52,20 @@ class Frame:
 
 def osm(frame,key):
     bbox=','.join(f'{v:.6f}' for v in frame.bbox())
-    selectors=['way[natural=coastline]','nwr[natural=water]','nwr[waterway=riverbank]','way[waterway~"^(river|stream|canal)$"]','nwr[water=sea]','way[highway~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified)$"]','nwr[aeroway=aerodrome]','way[aeroway=runway]','nwr[harbour][harbour!=no]','nwr[landuse=port]','nwr[industrial=port]','nwr[amenity=ferry_terminal]','nwr[man_made=pier]','nwr[man_made=quay]']
+    selectors=['way[natural=coastline]','nwr[natural=water][water~"^(river|canal|sea)$"]','nwr[waterway=riverbank]','way[waterway~"^(river|stream|canal)$"]','nwr[water=sea]','way[highway~"^(motorway|trunk|primary|secondary)$"]','nwr[aeroway=aerodrome]','way[aeroway=runway]','nwr[harbour][harbour!=no]','nwr[landuse=port]','nwr[industrial=port]','nwr[amenity=ferry_terminal]','nwr[man_made=pier]','nwr[man_made=quay]']
     query='[out:json][timeout:150];('+''.join(s+'('+bbox+');' for s in selectors)+');out geom;'
-    return cached_json('osm-'+key,os.getenv('OVERPASS_URL','https://overpass-api.de/api/interpreter'),post={'data':query})['elements']
+    return cached_json('osm-v2-'+key,os.getenv('OVERPASS_URL','https://overpass-api.de/api/interpreter'),post={'data':query})['elements']
 
 def geom(e,f):
     def line(g): return LineString([f.xy(p['lon'],p['lat']) for p in g]) if len(g)>=2 else None
     if e['type']=='node': return Point(f.xy(e['lon'],e['lat']))
     if e['type']=='way':
         g=line(e.get('geometry',[])); return g
+    # Only actual polygon boundaries, never route/member centre lines.
+    if e.get('tags',{}).get('type') not in ('multipolygon','boundary'): return None
     outer=[]; inner=[]
     for m in e.get('members',[]):
+        if m.get('role','') not in ('outer','inner',''): continue
         l=line(m.get('geometry',[]))
         if l is not None: (inner if m.get('role')=='inner' else outer).append(l)
     if not outer: return None
@@ -123,23 +126,133 @@ def dem(frame):
         result[k]=h[(py[k]%256).astype(int),(px[k]%256).astype(int)]
     return nd.gaussian_filter(result,1.1)
 
-def line_width(t,m):
-    try: width=float(re.match(r'[\d.]+',t.get('width','')).group())
-    except (AttributeError,ValueError): width={'river':max(9*m,80),'canal':max(4*m,25),'stream':max(m,5)}.get(t.get('waterway'),m)
-    return max(1,min(35,width/m))
+# Seoul's actual civil airport: official Korean AIP ARP, not an arbitrary aerodrome.
+GIMPO=(37+33/60+25/3600,126+47/60+51/3600)
+SEOUL_CENTER=(37.5665,126.92)  # 25 km: retain scale, include Gimpo; east edge shifts west.
+SEOUL_RIVERS=('한강','중랑천','탄천','안양천','홍제천','불광천','청계천','양재천','도림천','한강','Han River','Hangang','Jungnang','Tancheon','Anyangcheon','Hongje','Bulgwang','Cheonggye','Yangjae','Dorim')
 
-def airport(grid,center,horizontal):
+def name_of(t):
+    return ' '.join(str(t.get(k,'')) for k in ('name','name:ko','name:en','official_name','ref'))
+
+def named_key(t):
+    return str(t.get('name:ko') or t.get('name') or t.get('name:en') or t.get('ref') or '').strip()
+
+def width_m(t):
+    v=str(t.get('width','')).strip().lower()
+    m=re.fullmatch(r'(\d+(?:\.\d+)?)\s*(m|metres?|meters?|ft|feet)?',v)
+    if not m: return None
+    w=float(m.group(1))*(.3048 if m.group(2) in ('ft','feet') else 1)
+    return w if w>0 else None
+
+def line_width(t,m):
+    # Unknown width is a narrow one-cell fallback, not 9 or 4 tiles.
+    return max(1,min(35,(width_m(t) or m)/m))
+
+def underground(t):
+    return (t.get('tunnel') not in (None,'no','false','0') or t.get('location')=='underground' or t.get('covered')=='yes' or t.get('intermittent')=='yes' or t.get('seasonal')=='yes')
+
+def line_mask(g,width=1):
+    im=Image.new('1',(N,N)); d=ImageDraw.Draw(im)
+    def draw(a):
+        if a.is_empty: return
+        if a.geom_type in ('LineString','LinearRing'):
+            d.line([(math.floor(x),math.floor(y)) for x,y in a.coords],fill=1,width=int(width))
+        elif hasattr(a,'geoms'):
+            for b in a.geoms: draw(b)
+    draw(g.intersection(box(-3,-3,N+3,N+3)))
+    return np.asarray(im,dtype=bool)
+
+def major_seoul(t):
+    n=name_of(t).lower(); return any(k.lower() in n for k in SEOUL_RIVERS)
+
+def water_masks(objects,frame,sea):
+    # Use measured surface polygons first; centre lines fill only missing river geometry.
+    lengths=Counter(); lines=[]; areas=[]
+    for t,g,_ in objects:
+        if underground(t): continue
+        k=t.get('waterway'); typ=t.get('water'); n=named_key(t)
+        if k in ('river','stream','canal') and g.geom_type in ('LineString','MultiLineString'):
+            lines.append((t,g));
+            if n: lengths[n]+=g.intersection(frame.domain).length*frame.m
+        if typ in ('river','canal') or k=='riverbank':
+            a=asarea(g)
+            if a.geom_type in ('Polygon','MultiPolygon'): areas.append((t,a))
+    selected=[]
+    for t,g in lines:
+        n=named_key(t); length=lengths[n] if n else g.intersection(frame.domain).length*frame.m
+        w=width_m(t) or 0; k=t.get('waterway'); known=getattr(frame,'city_code','')=='SEO' and major_seoul(t)
+        if k=='stream': keep=known or (bool(n) and length>=3000 and w>=20)
+        elif k=='river': keep=known or (bool(n) and length>=800) or length>=2000 or w>=20
+        else: keep=known or (bool(n) and length>=2000 and w>=15) or w>=40
+        if t.get('_ai_width') is not None: keep=True
+        if keep: selected.append((t,g))
+    center=np.zeros((N,N),bool)
+    for t,g in selected: center|=line_mask(g)
+    surface=np.zeros_like(center); water=np.zeros_like(center); center_near=nd.binary_dilation(center,iterations=2)
+    for t,a in areas:
+        am=mask(a); cells=int(am.sum()); known=getattr(frame,'city_code','')=='SEO' and major_seoul(t)
+        # Ignore tiny detached water patches; explicit large river surfaces are authoritative.
+        if t.get('_ai_surface') or cells>=100 or known or (cells>=4 and (am & center_near).any()): surface|=am
+    water|=surface
+    near=nd.binary_dilation(surface,iterations=1)
+    for t,g in selected:
+        w=t.get('_ai_width',line_width(t,frame.m))
+        if w<=1: lm=line_mask(g)
+        else: lm=mask(g.buffer(w/2,cap_style=2))
+        # Do not inflate a river where actual bank geometry is available.
+        water|=(lm & ~near) | line_mask(g)
+    water&=~sea
+    labels,n=nd.label(water,structure=np.ones((3,3),bool)); sizes=np.bincount(labels.ravel()); keep=sizes>=8; keep[0]=False
+    water=keep[labels]
+    return water
+
+def airport(grid,center,horizontal,max_shift=4):
     w,h=(40,16) if horizontal else (16,40); x,y=center; best=None
-    for dy in range(-20,21,2):
-        for dx in range(-20,21,2):
+    for dy in range(-max_shift,max_shift+1):
+        for dx in range(-max_shift,max_shift+1):
+            if dx*dx+dy*dy>max_shift*max_shift: continue
             l=int(round(x-w/2))+dx; t=int(round(y-h/2))+dy
             if l<0 or t<0 or l+w>N or t+h>N: continue
-            v=grid[t:t+h,l:l+w]; bad=np.count_nonzero(v!=LAND)
-            if bad: continue
+            v=grid[t:t+h,l:l+w]
+            if np.any(v!=LAND): continue
             score=dx*dx+dy*dy
             if best is None or score<best[0]: best=(score,l,t)
     if best is None: return None
     _,l,t=best; grid[t:t+h,l:l+w]=AIRPORT; return [l,t,w,h]
+
+def airport_anchors(frame,objects,notes):
+    if hasattr(frame,'ai_airports'): return frame.ai_airports
+    runways=[g for t,g,_ in objects if t.get('aeroway')=='runway' and g.geom_type=='LineString' and g.length*frame.m>=1000]
+    if getattr(frame,'city_code','')=='SEO':
+        c=Point(frame.xy(GIMPO[1],GIMPO[0])); nearby=[r for r in runways if r.distance(c)*frame.m<=1800]
+        # Official runway alignment NW-SE; if geometry is missing, keep the nearest cardinal (vertical).
+        return [(c,max(nearby,key=lambda r:r.length) if nearby else None,False,'Gimpo (GMP/RKSS)')]
+    anchors=[]
+    for t,g,_ in sorted((o for o in objects if o[0].get('aeroway')=='aerodrome'),key=lambda item:asarea(item[1]).area,reverse=True):
+        if t.get('aerodrome') in ('military','private','airstrip') or t.get('military') not in (None,'no') or t.get('access')=='private': continue
+        a=asarea(g); c=a.centroid
+        nearby=[r for r in runways if a.distance(r)*frame.m<=800]
+        if not (t.get('iata') or t.get('aerodrome') in ('international','public','commercial') or (t.get('icao') and nearby)): continue
+        if any(c.distance(p)*frame.m<2000 for p,_,_,_ in anchors): continue
+        r=max(nearby,key=lambda r:r.length) if nearby else None
+        # Runway midpoint is a trustworthy anchor when inside the mapped airport.
+        if r is not None: c=r.interpolate(.5,normalized=True)
+        anchors.append((c,r,True,name_of(t).strip() or t.get('iata') or t.get('icao') or 'airport'))
+    return anchors
+
+def road_mask(objects,frame):
+    widths={'motorway':2,'trunk':2,'primary':1,'secondary':1}; totals=Counter(); roads=[]
+    for t,g,_ in objects:
+        k=t.get('highway')
+        if k not in widths or g.geom_type not in ('LineString','MultiLineString') or t.get('tunnel') not in (None,'no') or t.get('bridge') not in (None,'no'): continue
+        name=named_key(t); roads.append((t,g,name));
+        if name: totals[(k,name)]+=g.intersection(frame.domain).length*frame.m
+    result=np.zeros((N,N),bool)
+    for t,g,name in roads:
+        k=t['highway']; length=totals[(k,name)] if name else g.intersection(frame.domain).length*frame.m
+        if not t.get('_ai_width') and k=='secondary' and (not name or length<4000): continue
+        result|=line_mask(g.simplify(.65,preserve_topology=True),t.get('_ai_width',widths[k]))
+    return result
 
 def port(grid,center,piergeom,notes):
     # Candidate shore within 25 cells of mapped port/pier. All edits rollback if no valid terminal/connection.
@@ -209,12 +322,10 @@ def build(frame,elements,elev):
         except Exception as ex: notes.append(f'원자료 객체 {e.get("id")} 처리 실패: {ex}')
     grid[coast_mask([g for t,g,_ in objects if t.get('natural')=='coastline'],notes)]=SEA
     for t,g,_ in objects:
-        if t.get('natural')=='water' or t.get('waterway')=='riverbank' or t.get('water')=='sea':
-            p=asarea(g)
-            if p.geom_type in ('Polygon','MultiPolygon'):
-                w=mask(p); grid[w & (grid!=SEA)]=SEA if t.get('water')=='sea' else RIVER
-        elif t.get('waterway') in ('river','stream','canal'):
-            w=mask(g.buffer(line_width(t,frame.m)/2,cap_style=1)); grid[w & (grid!=SEA)]=RIVER
+        if t.get('water')=='sea':
+            a=asarea(g)
+            if a.geom_type in ('Polygon','MultiPolygon'): grid[mask(a)]=SEA
+    grid[water_masks(objects,frame,grid==SEA)]=RIVER
     # Adjustable mountain proxy: both relative relief and slope; preserve actual lowland.
     if elev is None: notes.append('고도 자료 없음: 산 검증 불가')
     else:
@@ -222,27 +333,18 @@ def build(frame,elements,elev):
         mountain=((relief>100)&(slope>.12))|((relief>180)&(elev>150)); mountain=nd.binary_opening(nd.binary_closing(mountain,iterations=2),iterations=1)
         grid[mountain & (grid==LAND)]=MOUNTAIN
     original_terrain=grid.copy()
-    runways=[g for t,g,_ in objects if t.get('aeroway')=='runway' and g.geom_type=='LineString']; airports=[]
-    facilities=[g for t,g,_ in objects if t.get('aeroway')=='aerodrome']
-    # Each mapped aerodrome, or unmatched mapped runway cluster. No invented airport.
-    anchors=[]
-    for g in sorted(facilities,key=lambda g:g.area,reverse=True):
-        g=asarea(g); c=g.centroid
-        if any(c.distance(p)<25 for p,_ in anchors): continue
-        nearby=[r for r in runways if g.distance(r)<15]
-        anchors.append((c,max(nearby,key=lambda r:r.length) if nearby else None))
-    for r in sorted(runways,key=lambda r:r.length,reverse=True):
-        c=r.centroid
-        if not any(c.distance(p)<35 for p,_ in anchors): anchors.append((c,r))
-    for c,r in anchors:
-        if not frame.domain.covers(c): continue
-        horizontal=True
+    airports=[]; frame.airport_details=[]
+    for c,r,horizontal,name in airport_anchors(frame,objects,notes):
+        if not frame.domain.covers(c):
+            notes.append(f'공항 {name} 실제 좌표가 맵 밖: 이동시키지 않음'); continue
         if r is not None:
             a,b=r.coords[0],r.coords[-1]; horizontal=abs(b[0]-a[0])>=abs(b[1]-a[1])
-        else: notes.append('활주로 방향 자료 없음: 공항 가로 방향 임시 적용')
-        a=airport(grid,(c.x,c.y),horizontal)
-        if a: airports.append(a)
-        else: notes.append(f'공항 배치 실패: {c.x:.0f},{c.y:.0f}')
+        else: notes.append(f'{name}: 활주로 방향 원자료 없음, 기본 방향 적용')
+        a=airport(grid,(c.x,c.y),horizontal,max_shift=max(1,min(4,int(200/frame.m))))
+        if a:
+            airports.append(a); lon,lat=frame.back.transform((c.x-N/2)*frame.m,(N/2-c.y)*frame.m)
+            frame.airport_details.append({'name':name,'source_lat_lon':[lat,lon],'source_tile':[c.x,c.y],'rectangle':a,'shift_m':math.hypot(a[0]+a[2]/2-c.x,a[1]+a[3]/2-c.y)*frame.m})
+        else: notes.append(f'공항 {name} 실제 좌표 인근 배치 실패: {c.x:.0f},{c.y:.0f}; 다른 지역으로 이동하지 않음')
     candidates=[]
     port_anchors=[asarea(g).centroid for t,g,_ in objects if t.get('harbour') not in (None,'no') or t.get('landuse')=='port' or t.get('industrial')=='port' or t.get('amenity')=='ferry_terminal']
     for t,g,_ in objects:
@@ -258,12 +360,7 @@ def build(frame,elements,elev):
         else: unresolved.append(c)
     for c in unresolved:
         if not any(c.distance(p)<25 for p in ports): notes.append(f'항구/부두 배치 실패: {c.x:.0f},{c.y:.0f}')
-    widths={'motorway':4,'trunk':3,'primary':3,'secondary':2,'tertiary':2,'residential':1,'unclassified':1}
-    for t,g,_ in objects:
-        if t.get('highway') not in widths or t.get('tunnel') not in (None,'no') or t.get('bridge') not in (None,'no'): continue
-        # Omit short residential fragments; do not paint over water, mountain, or facilities.
-        if t['highway'] in ('residential','unclassified') and g.length<6: continue
-        w=mask(g.buffer(widths[t['highway']]/2,cap_style=1)); grid[w & (grid==LAND)]=ROAD
+    roads=road_mask(objects,frame); grid[roads & (grid==LAND)]=ROAD
     errors=validate(grid,airports)
     # Compare against terrain derived directly from the source before gameplay simplification.
     # A pier is the only permitted change to sea; rivers and mountains must remain intact.
@@ -335,14 +432,19 @@ def main():
         if count>=a.limit: break
         count+=1; print('BUILD',code,city['name'],flush=True)
         try:
-            lat,lon=geocode(city); frame=Frame(lat,lon,float(city.get('km',a.km))); key=f'{code}-{lat:.5f}-{lon:.5f}-{frame.km}'; elements=osm(frame,key)
+            km=float(city.get('km',a.km))
+            if 'map_lat' in city and 'map_lon' in city: lat,lon=float(city['map_lat']),float(city['map_lon'])
+            elif code=='SEO' and km<34: lat,lon=SEOUL_CENTER
+            else: lat,lon=geocode(city)
+            frame=Frame(lat,lon,km); frame.city_code=code
+            key=f'{code}-{lat:.5f}-{lon:.5f}-{frame.km}'; elements=osm(frame,key)
             if not elements: raise RuntimeError('OSM 데이터가 비어 있음')
             try: elev=dem(frame)
             except Exception:
                 if not a.allow_no_dem: raise
                 elev=None
             grid,airports,ports,notes,errors,reference=build(frame,elements,elev)
-            report={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'orientation':'north-up','counts':{str(k):int(v) for k,v in Counter(grid.ravel()).items()},'airports':airports,'ports':ports,'status':'REVIEW_REQUIRED' if notes or errors else 'STRUCTURE_OK','structural_errors':errors,'notes':notes,'sources':['OpenStreetMap contributors (ODbL)','AWS Terrain Tiles (see source attribution)'],'geographic_validation':'Source terrain checked for sea/river/mountain changes; independent map or human review still needed','comparison_image':'left: source-derived terrain; right: game map'}
+            report={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'orientation':'north-up','counts':{str(k):int(v) for k,v in Counter(grid.ravel()).items()},'airports':airports,'airport_details':frame.airport_details,'generator_version':'2.0','ports':ports,'status':'REVIEW_REQUIRED' if notes or errors else 'STRUCTURE_OK','structural_errors':errors,'notes':notes,'sources':['OpenStreetMap contributors (ODbL)','AWS Terrain Tiles (see source attribution)'],'geographic_validation':'Source terrain checked for sea/river/mountain changes; independent map or human review still needed','comparison_image':'left: source-derived terrain; right: game map'}
             if errors: raise RuntimeError('; '.join(errors))
             save(a.out,city,grid,report)
             palette=np.zeros((256,3),np.uint8)
