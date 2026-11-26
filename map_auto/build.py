@@ -7,6 +7,7 @@ import numpy as np
 from scipy import ndimage as nd
 from PIL import Image, ImageDraw
 import requests, json5
+import pbf_source
 from pyproj import CRS, Transformer
 from shapely.geometry import Point, LineString, Polygon, box
 from shapely.ops import unary_union, polygonize
@@ -17,15 +18,6 @@ COLORS={0:'#4CAF50',1:'#1A237E',2:'#00BCD4',3:'#1B5E20',4:'#FFFFFF',5:'#BDBDBD',
 ROOT=Path(__file__).resolve().parents[1]; CACHE=ROOT/'.map-cache'; CACHE.mkdir(exist_ok=True)
 SESSION=requests.Session(); SESSION.headers['User-Agent']='mapaditer-game-map/1.0 (https://github.com/leo1109k-7063/mapaditer)'
 CROSS=nd.generate_binary_structure(2,1)
-
-class OverpassUnavailable(RuntimeError):
-    def __init__(self, message, splittable=False):
-        super().__init__(message); self.splittable=splittable
-
-# Prefer the last working endpoint, and avoid repeatedly contacting an unreachable host.
-_OSM_LAST=None
-_OSM_COOLDOWN={}
-_OSM_REQUESTS=0
 
 def _valid_json(data, overpass=False):
     if isinstance(data,dict) and data.get('remark'):
@@ -43,82 +35,17 @@ def _read_cache(p,overpass=False):
 def _write_cache(p,data):
     tmp=p.with_suffix('.tmp'); tmp.write_text(json.dumps(data,ensure_ascii=False)); tmp.replace(p)
 
-def _overpass_request(query,url):
-    global _OSM_LAST,_OSM_REQUESTS
-    endpoints=list(dict.fromkeys([_OSM_LAST,os.getenv('OVERPASS_URL') or 'https://overpass.private.coffee/api/interpreter',url,'https://overpass-api.de/api/interpreter']))
-    failures=[]; splittable=False
-    for endpoint in endpoints:
-        if not endpoint or _OSM_COOLDOWN.get(endpoint,0)>time.monotonic(): continue
-        if _OSM_REQUESTS>=60: raise RuntimeError('Overpass request budget exhausted; cached parts preserved')
-        _OSM_REQUESTS+=1
-        print(f'[OSM] request {_OSM_REQUESTS}: {endpoint}',flush=True)
-        try:
-            r=SESSION.post(endpoint,data={'data':query},timeout=(12,75))
-            if r.status_code==429:
-                raise RuntimeError(f'Overpass rate limit HTTP 429 at {endpoint}; stop and retry later')
-            if r.status_code in (400,401,403,422):
-                raise RuntimeError(f'Overpass HTTP {r.status_code} at {endpoint}: {r.text[:300]}')
-            if r.status_code in (502,503,504):
-                splittable=True; failures.append(f'{endpoint}: HTTP {r.status_code}'); continue
-            r.raise_for_status(); data=_valid_json(r.json(),True)
-            _OSM_LAST=endpoint
-            print(f'[OSM] OK: {len(data["elements"])} elements',flush=True)
-            time.sleep(1.5)
-            return data
-        except requests.ReadTimeout as e:
-            splittable=True; failures.append(f'{endpoint}: {e}')
-        except requests.ConnectionError as e:
-            _OSM_COOLDOWN[endpoint]=time.monotonic()+600; failures.append(f'{endpoint}: {e}')
-        except ValueError as e:
-            message=str(e); failures.append(f'{endpoint}: {message}')
-            splittable|=any(k in message.lower() for k in ('timeout','timed out','memory','runtime error'))
-        except requests.RequestException as e:
-            failures.append(f'{endpoint}: {e}')
-        time.sleep(2)
-    raise OverpassUnavailable(' | '.join(failures) or 'All endpoints temporarily unavailable',splittable)
-
-def fetch_osm_groups(selectors,bbox,url,depth=0):
-    # Each group and sub-region has its own cache key. Never treat a failed piece as empty.
-    bb=','.join(f'{v:.6f}' for v in bbox)
-    query='[out:json][timeout:55];('+''.join(s+'('+bb+');' for s in selectors)+');out geom;'
-    key=hashlib.sha256(query.encode()).hexdigest()[:24]
-    p=CACHE/('osm-piece-v3-'+key+'.json'); data=_read_cache(p,True)
-    if data is not None: return data['elements']
-    try: elements=_overpass_request(query,url)['elements']
-    except OverpassUnavailable as e:
-        if not e.splittable or depth>=2: raise RuntimeError(f'OSM group {selectors}, bbox {bb}: {e}') from e
-        print(f'[OSM] subdividing timed-out group {selectors}, bbox {bb}',flush=True)
-        if len(selectors)>1:
-            mid=len(selectors)//2
-            parts=[(selectors[:mid],bbox),(selectors[mid:],bbox)]
-        else:
-            south,west,north,east=bbox
-            if north-south >= (east-west)*math.cos(math.radians((north+south)/2)):
-                mid=(north+south)/2; parts=[(selectors,(south,west,mid,east)),(selectors,(mid,west,north,east))]
-            else:
-                mid=(west+east)/2; parts=[(selectors,(south,west,north,mid)),(selectors,(south,mid,north,east))]
-        elements=merge_osm(fetch_osm_groups(ss,bb2,url,depth+1) for ss,bb2 in parts)
-    _write_cache(p,{'elements':elements}); return elements
-
-def merge_osm(parts):
-    # Overpass out geom returns full ways; duplicate OSM IDs across overlapping queries are expected.
-    unique={}
-    for part in parts:
-        for e in part: unique[(e['type'],e['id'])]=e
-    return list(unique.values())
-
 def cached_json(key,url,params=None,post=None):
-    p=CACHE/(key+'.json'); overpass=bool(post and 'data' in post)
+    overpass=bool(post and 'data' in post); p=CACHE/(('pbf-query-v1-' if overpass else '')+key+'.json')
     data=_read_cache(p,overpass)
     if data is not None: return data
     if overpass:
-        # Existing AI airport lookup uses the same bbox for all selectors.
+        # Legacy caller (airport search) uses Overpass selector syntax only; read local PBF instead.
         query=post['data']; matches=list(re.finditer(r'((?:nwr|way|node|rel)(?:\[[^\]]+\])+?)\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\);',query))
-        if matches and len({m.groups()[1:] for m in matches})==1:
-            bbox=tuple(map(float,matches[0].groups()[1:])); selectors=[m.group(1) for m in matches]
-            elements=merge_osm(fetch_osm_groups([s],bbox,url) for s in selectors)
-            data={'elements':elements}
-        else: data=_overpass_request(query,url)
+        if not matches or len({m.groups()[1:] for m in matches})!=1:
+            raise RuntimeError('Unsupported local PBF query')
+        bbox=tuple(map(float,matches[0].groups()[1:])); selectors=[m.group(1) for m in matches]
+        data={'elements':pbf_source.elements(CACHE,bbox,selectors)}
     else:
         r=SESSION.post(url,data=post,timeout=(15,90)) if post else SESSION.get(url,params=params,timeout=(15,90))
         r.raise_for_status(); data=_valid_json(r.json())
@@ -149,26 +76,7 @@ class Frame:
         return min(lat),min(lon),max(lat),max(lon)
 
 def osm(frame,key):
-    global _OSM_REQUESTS
-    _OSM_REQUESTS=0
-    p=CACHE/('osm-v3-'+key+'.json'); data=_read_cache(p,True)
-    if data is not None: return data['elements']
-    # Small category requests reduce server load and keep successful data across failures.
-    groups=[
-        ['way[natural=coastline]','nwr[water=sea]'],
-        ['nwr[natural=water][water~"^(river|canal|sea)$"]','nwr[waterway=riverbank]'],
-        ['way[waterway~"^(river|stream|canal)$"]'],
-        ['way[highway~"^(motorway|trunk|primary)$"]'],
-        ['way[highway=secondary]'],
-        ['nwr[aeroway=aerodrome]','way[aeroway=runway]'],
-        ['nwr[harbour][harbour!=no]','nwr[landuse=port]','nwr[industrial=port]'],
-        ['nwr[amenity=ferry_terminal]','nwr[man_made=pier]','nwr[man_made=quay]']]
-    url=os.getenv('OVERPASS_URL') or 'https://overpass.private.coffee/api/interpreter'
-    parts=[]
-    for i,g in enumerate(groups,1):
-        print(f'[OSM] category {i}/{len(groups)}: {g}',flush=True)
-        parts.append(fetch_osm_groups(g,frame.bbox(),url))
-    elements=merge_osm(parts); _write_cache(p,{'elements':elements}); return elements
+    return pbf_source.elements(CACHE,frame.bbox(),pbf_source.SELECTORS)
 
 def geom(e,f):
     def line(g): return LineString([f.xy(p['lon'],p['lat']) for p in g]) if len(g)>=2 else None
