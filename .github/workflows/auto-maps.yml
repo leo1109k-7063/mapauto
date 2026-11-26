@@ -16,7 +16,7 @@ on:
         default: '3'
       model:
         description: 'Gemini API model ID'
-        default: 'gemini-2.5-flash'
+        default: 'gemini-3.8-flash'
 permissions:
   contents: read
 concurrency:
@@ -31,10 +31,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
           path: .map-cache
-          key: map-ai-cache-${{ github.run_id }}
+          key: map-ai-cache-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             map-ai-cache-
             map-cache-
@@ -50,6 +50,12 @@ jobs:
         run: |
           read -r -a codes <<< "$CODES"
           python map_auto/ai_agent.py --km "$KM" --limit "$LIMIT" --rounds "$ROUNDS" --codes "${codes[@]}"
+      - name: Save partial map data
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .map-cache
+          key: map-ai-cache-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
