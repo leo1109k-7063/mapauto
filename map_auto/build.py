@@ -20,11 +20,43 @@ CROSS=nd.generate_binary_structure(2,1)
 
 def cached_json(key,url,params=None,post=None):
     p=CACHE/(key+'.json')
-    if p.exists(): return json.loads(p.read_text())
-    r=SESSION.post(url,data=post,timeout=180) if post else SESSION.get(url,params=params,timeout=90)
-    r.raise_for_status(); data=r.json()
-    if isinstance(data,dict) and data.get('remark'): raise RuntimeError(data['remark'])
-    p.write_text(json.dumps(data,ensure_ascii=False)); return data
+    is_overpass=bool(post and 'data' in post)
+    def valid(data):
+        if isinstance(data,dict) and data.get('remark'):
+            raise ValueError(str(data['remark']))
+        if is_overpass and (not isinstance(data,dict) or not isinstance(data.get('elements'),list)):
+            raise ValueError('Invalid Overpass response: elements missing')
+        return data
+    if p.exists():
+        try: return valid(json.loads(p.read_text()))
+        except (ValueError,OSError): p.unlink(missing_ok=True)
+    if not is_overpass:
+        r=SESSION.post(url,data=post,timeout=(15,180)) if post else SESSION.get(url,params=params,timeout=(15,90))
+        r.raise_for_status(); data=valid(r.json())
+        p.write_text(json.dumps(data,ensure_ascii=False)); return data
+    # Fail over on connection errors, HTTP errors, and incomplete Overpass responses.
+    # Do not retry malformed queries or rotate endpoints to evade rate limits.
+    endpoints=list(dict.fromkeys([url,'https://overpass.private.coffee/api/interpreter','https://overpass-api.de/api/interpreter']))
+    failures=[]
+    for attempt in range(2):
+        for endpoint in endpoints:
+            print(f'[OSM] {key} attempt {attempt+1}: {endpoint}',flush=True)
+            try:
+                r=SESSION.post(endpoint,data=post,timeout=(15,180))
+                if r.status_code==429:
+                    raise RuntimeError(f'Overpass rate limit at {endpoint}; retry later (HTTP 429)')
+                if r.status_code in (400,401,403,422):
+                    raise RuntimeError(f'Overpass request rejected at {endpoint}: HTTP {r.status_code}: {r.text[:300]}')
+                r.raise_for_status(); data=valid(r.json())
+                p.write_text(json.dumps(data,ensure_ascii=False))
+                print(f'[OSM] OK: {len(data["elements"])} elements from {endpoint}',flush=True)
+                return data
+            except (requests.RequestException,ValueError) as ex:
+                msg=f'{endpoint}: {type(ex).__name__}: {str(ex)[:500]}'
+                failures.append(msg); print('[OSM] Failed: '+msg,flush=True)
+                time.sleep(3)
+        if attempt==0: time.sleep(12)
+    raise RuntimeError('Overpass data collection failed on all endpoints: '+' | '.join(failures))
 
 def geocode(city):
     if city.get('lat') is not None and city.get('lon') is not None: return float(city['lat']),float(city['lon'])
