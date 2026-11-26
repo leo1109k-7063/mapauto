@@ -34,13 +34,17 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: .map-cache
-          key: map-ai-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          key: map-pbf-cache-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            map-ai-cache-
-            map-cache-
+            map-pbf-cache-v1-
+      - name: Install local OSM tools
+        run: sudo apt-get update && sudo apt-get install -y osmium-tool
       - run: pip install -r map_auto/requirements.txt
+      - name: Test local map adapter
+        run: cd map_auto && python -m unittest -v test_pbf_source
       - name: Build with Gemini
         env:
+          PBF_URL: ${{ vars.PBF_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ inputs.model }}
           CODES: ${{ inputs.codes }}
@@ -55,7 +59,7 @@ jobs:
         if: always()
         with:
           path: .map-cache
-          key: map-ai-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          key: map-pbf-cache-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
