@@ -41,7 +41,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y osmium-tool
       - run: pip install -r map_auto/requirements.txt
       - name: Test local map adapter
-        run: cd map_auto && python -m unittest -v test_pbf_source
+        run: cd map_auto && python -m unittest discover -v
       - name: Build with Gemini
         env:
           PBF_URL: ${{ vars.PBF_URL }}
