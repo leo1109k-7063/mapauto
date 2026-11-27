@@ -40,7 +40,7 @@ class RoadPolicyTests(unittest.TestCase):
         other=e(5,'tertiary','Different',[(90,20),(100,20)])
         with patch.object(b,'geom',side_effect=lambda e,f:e['g']): groups,rows,rest=ai.catalog([a,z,c,d,other],self.f)
         self.assertEqual(len(groups),1); ident=next(iter(groups)); chosen=ai.choose(groups,rest,{'roads':[{'id':ident,'width':1}],'rivers':[]}); self.assertEqual({x['id'] for x in chosen},{1,2,3,4})
-        grid,*_=self.build(chosen); self.assertTrue(np.isin(grid[20,10:81],[8,82]).all()); self.assertEqual(grid[20,40],82); self.assertEqual(grid[20,89],0)
+        grid,*_=self.build(chosen); self.assertTrue(np.isin(grid[20,10:81],[8,82]).all()); self.assertEqual(grid[20,40],8); self.assertEqual(grid[20,89],0)
     def test_small_interchange_gap_preserve_both_ends(self):
         a=e(1,'primary','Same',[(10,20),(30,20)],_ai_width=1); c=e(2,'primary','Same',[(34,20),(80,20)],_ai_width=1)
         grid,*_=self.build([a,c]); self.assertTrue((grid[20,10:81]==8).all()); self.assertEqual(self.f.network_stats['visible_road_components'],1)

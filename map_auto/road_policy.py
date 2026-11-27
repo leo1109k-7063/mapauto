@@ -203,10 +203,21 @@ def simplify_route(route,land,protected):
     return thin|uncovered|(dry&edges)
 
 
-def layout(objects,source,water,land,raster,frame,tunnel_allowed=None):
+def layout(objects,source,water,land,raster,frame,mountain=None):
     """Full named corridors, simplified centerlines and only necessary ramp connectors."""
     groups=defaultdict(list)
-    if tunnel_allowed is None: tunnel_allowed=land|water
+    if mountain is None: mountain=np.zeros_like(land)
+    def road_masks(t,g,raw):
+        # Code 82 is a terrain overlap, not a copy of the OSM tunnel tag.
+        # An explicitly mapped underwater transverse crossing is represented as 81.
+        crossing_tags=t
+        if is_road_tunnel(t):
+            crossing_tags={**t,'bridge':'yes','tunnel':'no','location':'surface','covered':'no'}
+        true=bridge_cells(g,crossing_tags,water,raster,None)
+        mountain_line=orthogonalize(raw & mountain,mountain)
+        line=shift_to_land(raw&(land|water),land,true,nearest=nearest)|true|mountain_line
+        line=orthogonalize(line,land|true|mountain_line)
+        return line,true,mountain_line
     for t,g,i in objects:
         k=t.get('highway'); name=name_key(t)
         if k not in BASE|LINKS|EXTENSIONS or (k in LINKS|EXTENSIONS and not name): continue
@@ -224,10 +235,7 @@ def layout(objects,source,water,land,raster,frame,tunnel_allowed=None):
             width=int(t.get('_ai_width',1)); route_width=max(route_width,width)
             raw=raster(g.simplify(.6,preserve_topology=True)); is_ramp=has_main and t.get('highway') in LINKS
             if not is_ramp: raw_all|=raw
-            if is_road_tunnel(t):
-                line=orthogonalize(raw,tunnel_allowed); true=np.zeros_like(water); tun=line
-            else:
-                true=bridge_cells(g,t,water,raster,None); line=shift_to_land(raw&(land|water),land,true,nearest=nearest)|true; tun=np.zeros_like(water)
+            line,true,tun=road_masks(t,g,raw)
             if is_ramp: ramp|=line; ramp_bridge|=true; ramp_tunnel|=tun
             else: route|=line; route_bridge|=true; route_tunnel|=tun
         overlap+=route
@@ -244,7 +252,9 @@ def layout(objects,source,water,land,raster,frame,tunnel_allowed=None):
         route=orthogonalize(route,allowed)
         before=int(route.sum()); route=prune_spurs(route,protected|junction,max_length=8)
         pruned+=before-int(route.sum())
-        local=local_join(route,land)|route_bridge|route_tunnel|ramp
+        # Preserve the pre-simplification route as a possible connector, but
+        # only restore it if needed to join remaining main sections.
+        local=local_join(route|original,land,max_gap=3)|route_bridge|route_tunnel|ramp
         merged,stat=connected_network(route,local,allowed,preserve=True)
         if route_width>1:
             # A two-cell strip, rather than the former three-cell cross dilation.
@@ -256,14 +266,12 @@ def layout(objects,source,water,land,raster,frame,tunnel_allowed=None):
         k=t.get('highway'); name=name_key(t)
         if k not in LINKS or (name and name not in groups): continue
         raw=raster(g.simplify(.6,preserve_topology=True))
-        if is_road_tunnel(t):
-            tun=orthogonalize(raw,tunnel_allowed); tunnel|=tun; corridor|=tun
-        else:
-            true=bridge_cells(g,t,water,raster,None); bridge|=true; corridor|=orthogonalize(shift_to_land(raw&(land|water),land,true,nearest=nearest)|true,land|true)
+        line,true,tun=road_masks(t,g,raw)
+        tunnel|=tun; bridge|=true; corridor|=line
     allowed=land|bridge|tunnel
     corridor|=local_join(selected,land,max_gap=1)
     roads,stats=connected_network(selected,corridor,allowed,preserve=True)
     stats['review_required']=bool(stats['review_required'] or any(d['unplaced_nonwater_tiles']>=3 or d['unplaced_water_tiles']>=3 for d in details))
     stats['named_routes']=details; stats['route_count']=len(details); stats['unplaced_source_tiles']=int(missing.sum()); stats['pruned_spur_tiles']=sum(d['pruned_spur_tiles'] for d in details)
-    frame.road_tunnels=roads&tunnel
+    frame.road_tunnels=roads&mountain
     return roads,roads&water&bridge&~frame.road_tunnels,stats,missing

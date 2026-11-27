@@ -487,7 +487,7 @@ def build(frame,elements,elev):
             ports.append(q); frame.facility_relocations.append(relocation_record(frame,name,'port',source,q))
     # Road wins on a real river crossing, but not on sea, mountains or facility tiles.
     road_land=grid==LAND
-    roads,crossings,road_stats,road_missing=rp.layout(objects,source_objects,water,road_land,line_mask,frame,tunnel_allowed=np.isin(grid,[LAND,RIVER,MOUNTAIN,SEA]))
+    roads,crossings,road_stats,road_missing=rp.layout(objects,source_objects,water,road_land,line_mask,frame,mountain=grid==MOUNTAIN)
     frame.network_removed['road']=road_missing
     grid[roads]=ROAD
     grid[crossings]=ROAD_RIVER
@@ -504,12 +504,13 @@ def build(frame,elements,elev):
         if stats['added_tiles']: notes.append(f'{name}: 실제 지도 경로 및 대각선 보정으로 {stats["added_tiles"]}칸 연결')
     # Compare against terrain derived directly from the source before gameplay simplification.
     # A pier is the only permitted change to sea; rivers and mountains must remain intact.
-    invalid_water=((original_terrain==SEA)&~np.isin(grid,[SEA,PIER,ROAD_TUNNEL]))|((original_terrain==RIVER)&~np.isin(grid,[RIVER,ROAD_RIVER,ROAD_TUNNEL]))
+    invalid_water=((original_terrain==SEA)&~np.isin(grid,[SEA,PIER]))|((original_terrain==RIVER)&~np.isin(grid,[RIVER,ROAD_RIVER]))
     if invalid_water.any(): errors.append('원자료 수역과 불일치')
     if ((original_terrain==MOUNTAIN)&(grid!=MOUNTAIN)&~tunnels).any(): errors.append('원자료 산지와 불일치')
+    if (tunnels & (original_terrain!=MOUNTAIN)).any(): errors.append('산 이외의 지형에 82 생성')
     land=grid==LAND; labels,n=nd.label(land,structure=CROSS); sizes=np.bincount(labels.ravel()); largest=int(sizes[1:].max()) if n else 0
     if land.sum()<N*N*.12 or largest<2500: notes.append('건축용 연결 평지 부족 가능성: 맵 범위/산 기준 검토')
-    notes.append('실제 횡단 교량만 81; 실제 도로 터널은 82; 하천변/고가도로는 육지로 조정; 복개 구간은 논리적 수계에만 포함')
+    notes.append('실제 수역 횡단 도로만 81; 산과 도로가 겹치는 곳만 82; 하천변/고가도로는 육지로 조정; 복개 구간은 논리적 수계에만 포함')
     return grid,airports,len(ports),notes,errors,original_terrain
 
 def save(out,city,grid,report):

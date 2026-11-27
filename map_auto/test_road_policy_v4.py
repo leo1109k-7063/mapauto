@@ -18,19 +18,28 @@ class V4(unittest.TestCase):
         t=e(3,'primary','A',[(200,240),(200,260)],tunnel='yes',_ai_width=1)
         z=e(4,'primary','A',[(200,260),(200,300)],_ai_width=1)
         grid,_,_,_,errors,_=self.build([river,a,t,z]); self.assertFalse(errors,errors)
-        self.assertEqual(grid[250,200],82); self.assertEqual(grid[220,200],8); self.assertFalse((grid==81).any())
+        self.assertEqual(grid[250,200],81); self.assertEqual(grid[220,200],8); self.assertFalse((grid==82).any())
         self.assertEqual(self.f.network_stats['visible_road_components'],1); self.assertEqual(self.f.network_stats['logical_river_components'],1)
-        self.assertEqual(self.f.tunnel_underlying[str(250*500+200)],2)
+        self.assertEqual(self.f.tunnel_underlying,{})
         with tempfile.TemporaryDirectory() as d:
             b.save(Path(d),{'code':'TEST','name':'Test'},grid,{'tunnel_underlying':self.f.tunnel_underlying})
-            self.assertEqual(Image.open(Path(d)/'TEST.png').getpixel((200,250)),(255,165,0))
+            self.assertEqual(Image.open(Path(d)/'TEST.png').getpixel((200,250)),(184,134,11))
             self.assertIn("82:'82'",(Path(d)/'TEST.html').read_text())
-            self.assertIn(250*500+200,json.loads((Path(d)/'TEST.json').read_text())['road_tunnel_tiles'])
+            self.assertNotIn(250*500+200,json.loads((Path(d)/'TEST.json').read_text())['road_tunnel_tiles'])
     def test_actual_tunnel_through_mountain(self):
         elev=np.zeros((500,500)); elev[200:280,200:280]=400
         t=e(1,'trunk','Tunnel',[(190,240),(290,240)],tunnel='yes',_ai_width=1)
         grid,_,_,_,errors,terrain=self.build([t],elev)
         self.assertFalse(errors,errors); self.assertTrue(((terrain==3)&(grid==82)).any()); self.assertEqual(self.f.network_stats['visible_road_components'],1)
+    def test_mountain_overlap_without_tunnel_tag(self):
+        elev=np.zeros((500,500)); elev[200:280,200:280]=400
+        t=e(1,'trunk','Road',[(190,240),(290,240)],_ai_width=1)
+        grid,_,_,_,errors,terrain=self.build([t],elev)
+        self.assertFalse(errors,errors)
+        self.assertTrue(((terrain==3)&(grid==82)).any())
+        self.assertFalse(((terrain!=3)&(grid==82)).any())
+        self.assertEqual(grid[240,190],8); self.assertEqual(grid[240,290],8)
+        self.assertEqual(self.f.network_stats['visible_road_components'],1)
     def test_spurs_removed_main_preserved(self):
         a=e(1,'primary','A',[(0,100),(499,100)],_ai_width=1)
         z=e(2,'primary','A',[(120,100),(120,106)],_ai_width=1)
@@ -55,7 +64,7 @@ class V4(unittest.TestCase):
         with patch.object(b,'geom',side_effect=lambda e,f:e['g']): groups,rows,rest=ai.catalog([a,t,z],self.f)
         self.assertEqual(len(groups),1); self.assertEqual(rows[0]['name'],'Main'); self.assertEqual(rows[0]['tunnel_segments'],1)
         selected=ai.choose(groups,rest,{'rivers':[],'roads':[{'id':rows[0]['id'],'width':1}]})
-        grid,*_=self.build(selected); self.assertEqual(grid[20,40],82); self.assertEqual(self.f.network_stats['visible_road_components'],1)
+        grid,*_=self.build(selected); self.assertEqual(grid[20,40],8); self.assertEqual(self.f.network_stats['visible_road_components'],1)
     def test_ambiguous_tunnel_not_moved_to_wrong_name(self):
         a=e(1,'primary','Main',[(10,20),(30,20)])
         t=e(2,'trunk','Named Tunnel',[(30,20),(50,20)],tunnel='yes')

@@ -21,6 +21,13 @@ class ReviewV2(unittest.TestCase):
         with patch.object(ai,'call',side_effect=[{'rivers':[{'id':'FAKE','width':1}]},{'next_plan':None}]):
             nxt=ai.next_revision({'issues':['River connectivity'],'next_plan':self.plan},self.plan,self.ctx,{'road_fraction':.02},[],'A1','revise')
         self.assertIsNone(nxt)
+    def test_bare_plan_review_requests_targeted_connectivity_revision(self):
+        bare=dict(self.plan,reason='Unwrapped plan, not a valid review')
+        with patch.object(ai,'call',return_value={'roads':[{'id':'D1','width':1},{'id':'D2','width':1}]}) as call:
+            nxt=ai.next_revision(bare,self.plan,self.ctx,{'road_fraction':.04732,'connectivity':{'roads':{'review_required':True}}},[],'A1','revise')
+        self.assertEqual([x['id'] for x in nxt['roads']],['D1','D2'])
+        self.assertEqual(nxt['rivers'],self.plan['rivers'])
+        self.assertTrue(call.call_args.kwargs['stage'].endswith('_named_connectivity_v3'))
     def test_feature_loss(self):
         class F: pass
         f=F(); g=LineString([(10,10),(20,10)]); m=ai.b.line_mask(g,1); f.network_removed={'road':m,'river':np.zeros_like(m)}
