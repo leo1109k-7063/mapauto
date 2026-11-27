@@ -242,6 +242,50 @@ def airport(grid,center,horizontal,max_shift=4):
     if best is None: return None
     _,l,t=best; grid[t:t+h,l:l+w]=AIRPORT; return [l,t,w,h]
 
+def allowed_facility_move(frame,source,target,limit=7000):
+    from pyproj import Geod
+    a=frame.back.transform((source.x-250)*frame.m,(250-source.y)*frame.m)
+    z=frame.back.transform((target.x-250)*frame.m,(250-target.y)*frame.m)
+    distance=abs(Geod(ellps='WGS84').inv(*a,*z)[2])
+    guard=getattr(frame,'facility_guard',None)
+    return distance<=limit and (guard is None or guard.is_empty or not guard.intersects(LineString([source,target])))
+
+def relocate_airport(grid,frame,source,horizontal):
+    w,h=(40,16) if horizontal else (16,40)
+    # Integral image: exact rectangle land coverage for every possible anchor.
+    integral=np.pad((grid!=LAND).astype(np.int32),((1,0),(1,0))).cumsum(0).cumsum(1)
+    sums=integral[h:,w:]-integral[:-h,w:]-integral[h:,:-w]+integral[:-h,:-w]
+    y,x=np.where(sums==0); d=(x+w/2-source.x)**2+(y+h/2-source.y)**2
+    for i in np.argsort(d):
+        if d[i]*frame.m**2>7000**2: break
+        l,t=int(x[i]),int(y[i]); q=Point(l+w/2,t+h/2)
+        if allowed_facility_move(frame,source,q):
+            grid[t:t+h,l:l+w]=AIRPORT; return [l,t,w,h]
+    return None
+
+def relocation_record(frame,name,kind,source,target):
+    from pyproj import Geod
+    def coords(p):
+        lon,lat=frame.back.transform((p.x-250)*frame.m,(250-p.y)*frame.m); return [lat,lon]
+    a,z=coords(source),coords(target)
+    return {'name':name,'kind':kind,'actual_lat_lon':a,'placed_lat_lon':z,'actual_tile':[source.x,source.y],'placed_tile':[target.x,target.y],'distance_m':abs(Geod(ellps='WGS84').inv(a[1],a[0],z[1],z[0])[2])}
+
+def relocate_port(grid,frame,source,notes):
+    sea=grid==SEA; coast=(grid==LAND)&nd.binary_dilation(sea,structure=CROSS)
+    y,x=np.where(coast); d=(x-source.x)**2+(y-source.y)**2
+    for i in np.argsort(d):
+        if d[i]*frame.m**2>7000**2: break
+        q=Point(int(x[i]),int(y[i]))
+        if not allowed_facility_move(frame,source,q): continue
+        trial=grid.copy(); trial_notes=[]
+        if not port(trial,(q.x,q.y),None,trial_notes): continue
+        yy,xx=np.where((trial==PORT)&(grid!=PORT))
+        if not len(xx): continue
+        actual=Point(float(xx.mean()+.5),float(yy.mean()+.5))
+        if not allowed_facility_move(frame,source,actual): continue
+        grid[:]=trial; notes.extend(trial_notes); return actual
+    return None
+
 def airport_anchors(frame,objects,notes):
     if hasattr(frame,'ai_airports'): return frame.ai_airports
     runways=[g for t,g,_ in objects if t.get('aeroway')=='runway' and g.geom_type=='LineString' and g.length*frame.m>=1000]
@@ -298,7 +342,8 @@ def port(grid,center,piergeom,notes):
     pm=np.zeros_like(sea)
     if piergeom is not None:
         p=asarea(piergeom); pm=mask(p if p.geom_type in ('Polygon','MultiPolygon') else p.buffer(1.25,cap_style=2)) & sea
-    adjacent=sea & nd.binary_dilation(grid==PORT,structure=CROSS)
+    local_port=np.zeros_like(sea); local_port[t:t+h,l:l+w]=True
+    adjacent=sea & nd.binary_dilation(local_port,structure=CROSS)
     if not adjacent.any(): grid[:]=old; return False
     ay,ax=np.where(adjacent); j=np.argmin((ax-cx)**2+(ay-cy)**2); sx,sy=int(ax[j]),int(ay[j]); pm[sy,sx]=True
     # Retain mapped pier shape and join its nearest point to the harbor, if possible.
@@ -313,7 +358,7 @@ def port(grid,center,piergeom,notes):
         pm|=mask(LineString([(sx,sy),(sx+dx*6,sy+dy*6)]).buffer(1.15,cap_style=2)) & sea
         notes.append('실제 항구 위치에 부두 자료 부족: 표준 부두로 단순화')
     labels,n=nd.label(pm,structure=CROSS); keep=np.unique(labels[adjacent & pm]); keep=keep[keep>0]; pm=np.isin(labels,keep)
-    if not pm.any() or not (nd.binary_dilation(pm,structure=CROSS)&sea&~pm).any() or not (nd.binary_dilation(grid==PORT,structure=CROSS)&(grid==LAND)).any(): grid[:]=old; return False
+    if not pm.any() or not (nd.binary_dilation(pm,structure=CROSS)&sea&~pm).any() or not (nd.binary_dilation(local_port,structure=CROSS)&(grid==LAND)).any(): grid[:]=old; return False
     grid[pm]=PIER; return True
 
 def validate(grid,airports):
@@ -355,18 +400,24 @@ def build(frame,elements,elev):
         mountain=((relief>100)&(slope>.12))|((relief>180)&(elev>150)); mountain=nd.binary_opening(nd.binary_closing(mountain,iterations=2),iterations=1)
         grid[mountain & (grid==LAND)]=MOUNTAIN
     original_terrain=grid.copy()
-    airports=[]; frame.airport_details=[]
+    airports=[]; frame.airport_details=[]; frame.facility_relocations=[]; frame.facility_unresolved=[]
     for c,r,horizontal,name in airport_anchors(frame,objects,notes):
-        if not frame.domain.covers(c):
-            notes.append(f'공항 {name} 실제 좌표가 맵 밖: 이동시키지 않음'); continue
         if r is not None:
-            a,b=r.coords[0],r.coords[-1]; horizontal=abs(b[0]-a[0])>=abs(b[1]-a[1])
+            aa,zz=r.coords[0],r.coords[-1]; horizontal=abs(zz[0]-aa[0])>=abs(zz[1]-aa[1])
         else: notes.append(f'{name}: 활주로 방향 원자료 없음, 기본 방향 적용')
-        a=airport(grid,(c.x,c.y),horizontal,max_shift=max(1,min(4,int(200/frame.m))))
+        w,h=(40,16) if horizontal else (16,40)
+        fits=box(w/2,h/2,N-w/2,N-h/2).covers(c)
+        a=airport(grid,(c.x,c.y),horizontal,max_shift=max(1,min(4,int(200/frame.m)))) if fits else None
+        relocated=False
+        if not a and not fits and name in getattr(frame,'airport_relocation_names',set()):
+            a=relocate_airport(grid,frame,c,horizontal); relocated=bool(a)
         if a:
-            airports.append(a); lon,lat=frame.back.transform((c.x-N/2)*frame.m,(N/2-c.y)*frame.m)
-            frame.airport_details.append({'name':name,'source_lat_lon':[lat,lon],'source_tile':[c.x,c.y],'rectangle':a,'shift_m':math.hypot(a[0]+a[2]/2-c.x,a[1]+a[3]/2-c.y)*frame.m})
-        else: notes.append(f'공항 {name} 실제 좌표 인근 배치 실패: {c.x:.0f},{c.y:.0f}; 다른 지역으로 이동하지 않음')
+            airports.append(a); q=Point(a[0]+a[2]/2,a[1]+a[3]/2)
+            detail=relocation_record(frame,name,'airport',c,q); detail['rectangle']=a; detail['relocated']=relocated
+            frame.airport_details.append(detail)
+            if relocated: frame.facility_relocations.append(detail)
+        else:
+            notes.append(f'공항 {name} 허용 위치 배치 실패'); frame.facility_unresolved.append(name)
     candidates=[]
     port_anchors=[asarea(g).centroid for t,g,_ in objects if t.get('harbour') not in (None,'no') or t.get('landuse')=='port' or t.get('industrial')=='port' or t.get('amenity')=='ferry_terminal']
     for t,g,_ in objects:
@@ -376,12 +427,25 @@ def build(frame,elements,elev):
             if pier and not other and not any(c.distance(a)<30 for a in port_anchors): continue
             if frame.domain.covers(c): candidates.append((not pier,c,g if pier else None))
     ports=[]; unresolved=[]
+    # Inland ferry stops and quays are not ocean ports under current game rules.
+    sea_dist=nd.distance_transform_edt(grid!=SEA) if np.any(grid==SEA) else None
     for _,c,g in sorted(candidates,key=lambda a:a[0]):
+        x,y=min(N-1,max(0,int(c.x))),min(N-1,max(0,int(c.y)))
+        if sea_dist is None or sea_dist[y,x]>25: continue
         if any(c.distance(p)<12 for p in ports): continue
         if port(grid,(c.x,c.y),g,notes): ports.append(c)
         else: unresolved.append(c)
     for c in unresolved:
         if not any(c.distance(p)<25 for p in ports): notes.append(f'항구/부두 배치 실패: {c.x:.0f},{c.y:.0f}')
+    # Only externally verified, evidence-approved off-map ports may be abstracted onto nearby coast.
+    for ident,(source,kind,name) in getattr(frame,'relocatable_facilities',{}).items():
+        if kind!='port' or frame.domain.covers(source): continue
+        if not np.any(grid==SEA): frame.facility_unresolved.append(name); continue
+        if any(source.distance(p)*frame.m<500 for p in ports): continue
+        q=relocate_port(grid,frame,source,notes)
+        if q is None: frame.facility_unresolved.append(name); notes.append('항구/부두 배치 실패: '+name)
+        else:
+            ports.append(q); frame.facility_relocations.append(relocation_record(frame,name,'port',source,q))
     roads=road_mask(objects,frame); grid[roads & (grid==LAND)]=ROAD
     errors=validate(grid,airports)
     # Compare against terrain derived directly from the source before gameplay simplification.
