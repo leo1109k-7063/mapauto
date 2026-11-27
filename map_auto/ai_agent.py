@@ -17,51 +17,79 @@ class GeminiError(RuntimeError):
         super().__init__(f'Gemini {stage}: {message}')
 
 
+# Stay with the last working model during this process, but retain model-specific caches.
+ACTIVE_MODEL=None
+MODEL_TRACE=[]
+
+
+def model_order():
+    fallback=os.getenv('GEMINI_FALLBACK_MODELS','gemini-3.5-flash-lite')
+    candidates=[MODEL]+[m.strip() for m in fallback.split(',') if m.strip()]
+    if any(not re.fullmatch(r'[A-Za-z0-9._-]+',m) for m in candidates):
+        raise ValueError('Invalid Gemini model ID')
+    return list(dict.fromkeys(([ACTIVE_MODEL] if ACTIVE_MODEL in candidates else [])+candidates))
+
+
 def call(prompt,images=(),stage="inference",max_tokens=8192):
+    global ACTIVE_MODEL
     key=os.environ.get('GEMINI_API_KEY')
     if not key: raise GeminiError(stage,'GEMINI_API_KEY secret missing')
-    # Cache successful JSON calls by exact model/request, not credentials.
     parts=[{'text':prompt}]+[{'inlineData':{'mimeType':'image/png','data':base64.b64encode(x).decode()}} for x in images]
     body={'contents':[{'role':'user','parts':parts}], 'generationConfig':{'maxOutputTokens':max_tokens,'temperature':.2,'responseMimeType':'application/json'}}
     payload=json.dumps(body,ensure_ascii=False,separators=(',',':')).encode()
-    digest=hashlib.sha256(MODEL.encode()+b'\0'+payload).hexdigest()
-    cache=b.CACHE/('gemini-call-v2-'+digest+'.json')
-    cached=b._read_cache(cache)
-    if isinstance(cached,dict):
-        print('GEMINI CACHE',stage,flush=True); return cached
-    timeout=int(os.getenv('GEMINI_READ_TIMEOUT','300'))
-    timeout=max(60,min(600,timeout))
-    print(f'GEMINI {stage} {MODEL} request_bytes={len(payload)} timeout={timeout}s',flush=True)
-    last='unknown error'
-    for i in range(3):
-        print(f'GEMINI {stage} attempt {i+1}/3',flush=True)
-        try:
-            r=requests.post(f'https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent',headers={'x-goog-api-key':key},json=body,timeout=(15,timeout))
-        except (requests.exceptions.Timeout,requests.exceptions.ConnectionError) as ex:
-            last=f'{type(ex).__name__}: {str(ex).replace(key,"[redacted]")}'
-        else:
-            if r.ok:
-                try:
-                    data=r.json(); c=data.get('candidates',[{}])[0]
-                    text=''.join(p.get('text','') for p in c.get('content',{}).get('parts',[]) if not p.get('thought'))
-                    if not text: raise ValueError('no usable content; finishReason='+str(c.get('finishReason')))
-                    result=json.loads(text)
-                    if not isinstance(result,dict): raise ValueError('AI output must be object')
-                except (ValueError,IndexError,TypeError) as ex:
-                    last=f'invalid JSON response: {ex}'
-                else:
-                    b._write_cache(cache,result)
-                    return result
+    models=model_order()
+    timeout=max(60,min(600,int(os.getenv('GEMINI_READ_TIMEOUT','300'))))
+    attempts=2 if len(models)>1 else 3
+    failures=[]
+    def cache_path(model):
+        digest=hashlib.sha256(model.encode()+b'\0'+payload).hexdigest()
+        return b.CACHE/('gemini-call-v2-'+digest+'.json')
+    def success(model,result,cached=False):
+        global ACTIVE_MODEL
+        ACTIVE_MODEL=model
+        MODEL_TRACE.append({'stage':stage,'model':model,'cached':cached})
+        print('GEMINI SUCCESS',stage,model,'CACHE' if cached else 'API',flush=True)
+        return result
+    # Check every configured model's existing cache before making network requests.
+    for model in models:
+        cached=b._read_cache(cache_path(model))
+        if isinstance(cached,dict): return success(model,cached,True)
+    for model in models:
+        last='unknown error'
+        print(f'GEMINI {stage} {model} request_bytes={len(payload)} timeout={timeout}s',flush=True)
+        for i in range(attempts):
+            print(f'GEMINI {stage} {model} attempt {i+1}/{attempts}',flush=True)
+            try:
+                r=requests.post(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',headers={'x-goog-api-key':key},json=body,timeout=(15,timeout))
+            except (requests.exceptions.Timeout,requests.exceptions.ConnectionError) as ex:
+                last=f'{type(ex).__name__}: {str(ex).replace(key,"[redacted]")}'
             else:
-                last=f'HTTP {r.status_code}: {r.text[:4000].replace(key,"[redacted]")}'
-                # Do not repeatedly call an explicitly zero-quota project.
-                if r.status_code not in (429,500,502,503,504) or (r.status_code==429 and re.search(r'(?:limit|quotaValue)\s*[:=]\s*"?0(?:\D|$)',r.text,re.I)):
-                    raise GeminiError(stage,last)
-        if i<2:
-            delay=15*(i+1)
-            print(f'GEMINI {stage} retry in {delay}s: {last[:300]}',flush=True)
-            time.sleep(delay)
-    raise GeminiError(stage,'failed after 3 attempts: '+last)
+                if r.ok:
+                    try:
+                        data=r.json(); c=data.get('candidates',[{}])[0]
+                        text=''.join(p.get('text','') for p in c.get('content',{}).get('parts',[]) if not p.get('thought'))
+                        if not text: raise ValueError('no usable content; finishReason='+str(c.get('finishReason')))
+                        result=json.loads(text)
+                        if not isinstance(result,dict): raise ValueError('AI output must be object')
+                    except (ValueError,IndexError,TypeError,AttributeError) as ex:
+                        last=f'invalid JSON response: {ex}'
+                    else:
+                        b._write_cache(cache_path(model),result)
+                        return success(model,result)
+                else:
+                    last=f'HTTP {r.status_code}: {r.text[:4000].replace(key,"[redacted]")}'
+                    # Authentication, malformed requests and quota errors are not capacity fallback.
+                    # A missing model can be skipped; do not retry it repeatedly.
+                    if r.status_code==404: break
+                    if r.status_code not in (500,502,503,504):
+                        raise GeminiError(stage,'; '.join(failures+[model+': '+last]))
+            if i+1<attempts:
+                delay=15*(2**i)
+                print(f'GEMINI {stage} retry in {delay}s: {last[:300]}',flush=True)
+                time.sleep(delay)
+        failures.append(model+': '+last)
+        print('GEMINI MODEL FAILED',stage,model,last[:300],flush=True)
+    raise GeminiError(stage,'all configured models failed: '+'; '.join(failures))
 
 
 # Only public encyclopedia search is performed; no paid Gemini search tools.
@@ -272,6 +300,7 @@ def plan_city(ctx,raw,folder):
 
 def run_city(city,km,out,rounds):
     code=str(city['code']); folder=out/(code+'-ai'); folder.mkdir(parents=True,exist_ok=True)
+    MODEL_TRACE.clear()
     research=research_city(city,folder)
     lat,lon=(float(city['map_lat']),float(city['map_lon'])) if 'map_lat' in city and 'map_lon' in city else b.geocode(city)
     frame=b.Frame(lat,lon,float(city.get('km',km))); elements=b.osm(frame,f'{code}-{lat:.5f}-{lon:.5f}-{frame.km}'); elev=b.dem(frame)
@@ -290,13 +319,13 @@ def run_city(city,km,out,rounds):
         metrics={'counts':counts,'airports':airports,'airport_details':frame.airport_details,'fallbacks':placements,'unresolved':unresolved,'notes':notes,'errors':errors}
         if len(airports)!=len(frame.ai_airports): metrics['unresolved'].append('One or more planned airports could not be placed on land')
         # Save usable draft before review so a remote failure does not lose the map.
-        provisional={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'model':MODEL,'status':'REVIEW_PENDING','round':i+1,'metrics':metrics,'sources':['OpenStreetMap contributors','AWS Terrain Tiles','Wikipedia contributors (see research.json for links)']}
+        provisional={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'model':ACTIVE_MODEL or MODEL,'model_trace':list(MODEL_TRACE),'status':'REVIEW_PENDING','round':i+1,'metrics':metrics,'sources':['OpenStreetMap contributors','AWS Terrain Tiles','Wikipedia contributors (see research.json for links)']}
         (folder/f'round-{i+1}.metrics.json').write_text(json.dumps(provisional,ensure_ascii=False,indent=2))
         if not errors: b.save(out,city,grid,provisional)
         review=call(RULES+'\nCompare image 1 raw OSM reference (not independent satellite) and image 2 game map, plus research. Check river width, tributaries, water artifacts, road density, airport district and port connections. Return JSON {"approved":true or false,"issues":["..."],"next_plan":{...}}. If false supply complete revised plan using schema: '+SCHEMA+'\n'+evidence+'\nCurrent plan/metrics: '+packed({'plan':plan,'metrics':metrics}),images=[reduced,image],stage=f"review_{i+1}",max_tokens=8192)
         history.append({'plan':plan,'metrics':metrics,'review':review}); (folder/'history.json').write_text(json.dumps(history,ensure_ascii=False,indent=2))
         approved=review.get('approved') is True and not errors and not metrics['unresolved'] and not any('고도 자료 없음' in n or '해안선이 닫히지' in n or '항구/부두 배치 실패' in n for n in notes)
-        report={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'model':MODEL,'status':'AI_APPROVED' if approved else 'REVIEW_REQUIRED','round':i+1,'metrics':metrics,'review':review,'sources':['OpenStreetMap contributors','AWS Terrain Tiles','Wikipedia contributors (see research.json for links)']}
+        report={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'model':ACTIVE_MODEL or MODEL,'model_trace':list(MODEL_TRACE),'status':'AI_APPROVED' if approved else 'REVIEW_REQUIRED','round':i+1,'metrics':metrics,'review':review,'sources':['OpenStreetMap contributors','AWS Terrain Tiles','Wikipedia contributors (see research.json for links)']}
         if not errors: b.save(out,city,grid,report)
         else: (folder/f'round-{i+1}.error.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
         if approved: return True
@@ -322,6 +351,6 @@ def main():
             if not run_city(city,a.km,a.out,a.rounds): fail+=1; print('REVIEW REQUIRED',code,flush=True)
             else: print('AI APPROVED',code,flush=True)
         except Exception as e:
-            fail+=1; msg=str(e).replace(os.environ['GEMINI_API_KEY'],'[redacted]'); (a.out/(code+'.error.json')).write_text(json.dumps({'error':msg,'stage':getattr(e,'stage','local_processing'),'type':type(e).__name__},ensure_ascii=False,indent=2)); print('FAILED',code,msg,flush=True)
+            fail+=1; msg=str(e).replace(os.environ['GEMINI_API_KEY'],'[redacted]'); (a.out/(code+'.error.json')).write_text(json.dumps({'error':msg,'stage':getattr(e,'stage','local_processing'),'type':type(e).__name__,'model_trace':list(MODEL_TRACE)},ensure_ascii=False,indent=2)); print('FAILED',code,msg,flush=True)
     return int(bool(fail))
 if __name__=='__main__': sys.exit(main())
