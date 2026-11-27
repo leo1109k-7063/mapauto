@@ -417,7 +417,9 @@ def build(frame,elements,elev):
             except Exception as ex: notes.append(f'연결 원자료 객체 {e.get("id")} 처리 실패: {ex}')
     road_corridor,river_corridor=source_corridors(source_objects)
     water=water_masks(objects,frame,grid==SEA)
+    selected_water=water.copy()
     water,river_stats=connected_network(water,river_corridor,grid!=SEA)
+    frame.network_removed={'river':selected_water & ~water}
     grid[water]=RIVER
     # Adjustable mountain proxy: both relative relief and slope; preserve actual lowland.
     if elev is None: notes.append('고도 자료 없음: 산 검증 불가')
@@ -475,7 +477,9 @@ def build(frame,elements,elev):
     # Road wins on a real river crossing, but not on sea, mountains or facility tiles.
     road_allowed=np.isin(grid,[LAND,RIVER])
     roads=road_mask(objects,frame)&road_allowed
+    selected_roads=roads.copy()
     roads,road_stats=connected_network(roads,road_corridor,road_allowed)
+    frame.network_removed['road']=selected_roads & ~roads
     crossings=roads & water
     grid[roads]=ROAD
     grid[crossings]=ROAD_RIVER

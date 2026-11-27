@@ -259,7 +259,7 @@ def road_load(plan,ctx):
     return sum(rows[x['id']][3]*x['width'] for x in plan.get('roads',[]) if x['id'] in rows)
 
 
-def thin_roads(plan,ctx,keep_ids=None):
+def thin_roads(plan,ctx,keep_ids=None,ratio=.65):
     """Conservative fallback, using only already selected real road IDs.
     AI can choose the subset; if it repeats a plan, rank by named class and length.
     Connectivity is still enforced by the raster engine, not by this heuristic.
@@ -268,7 +268,7 @@ def thin_roads(plan,ctx,keep_ids=None):
     rows={r[0]:r for r in ctx['catalog']['road']}
     current=[x for x in result['roads'] if x['id'] in rows]
     if len(current)<2: return result
-    cap=max(1,int(len(current)*.65))
+    cap=max(1,int(len(current)*ratio))
     def priority(x):
         r=rows[x['id']]; classes=set(r[2]); tier=3 if classes & {'motorway','trunk'} else 2 if 'primary' in classes else 1
         return (bool(r[1]),tier,r[3],r[0])
@@ -284,25 +284,99 @@ def thin_roads(plan,ctx,keep_ids=None):
     return result
 
 
+def feature_loss(groups,plan,frame):
+    """Attribute removed pixels to mapped feature geometries; overlapping IDs may share pixels."""
+    result={}
+    for kind,field in [('road','roads'),('river','rivers')]:
+        missing=getattr(frame,'network_removed',{}).get(kind)
+        records=[]
+        if missing is not None and missing.any():
+            for item in plan.get(field,[]):
+                z=groups.get(item['id'])
+                if not z: continue
+                footprint=np.zeros_like(missing)
+                for g,polygon in z['geoms']:
+                    if polygon:
+                        if item.get('banks')=='narrow' and any(not pp for _,pp in z['geoms']): continue
+                        footprint|=b.mask(g)
+                    else:
+                        footprint|=b.line_mask(g,item['width'])
+                n=int((footprint&missing).sum())
+                if n: records.append({'id':item['id'],'name':z['name'],'overlap_removed_tiles':n,'footprint_tiles':int(footprint.sum())})
+        result[field]=sorted(records,key=lambda x:-x['overlap_removed_tiles'])
+    return result
+
+
+def checked_subset(items,rows,field):
+    if not isinstance(items,list): return None
+    valid={r[0] for r in rows}; seen=set(); out=[]
+    for x in items:
+        if not isinstance(x,dict): return None
+        ident=x.get('id'); w=x.get('width')
+        if not isinstance(ident,str) or ident not in valid or ident in seen or type(w)!=int or not 1<=w<=(2 if field=='roads' else 20): return None
+        seen.add(ident); y={'id':ident,'width':w}
+        if field=='rivers':
+            if x.get('banks','actual') not in ('actual','narrow'): return None
+            y['banks']=x.get('banks','actual')
+        out.append(y)
+    return out
+
+
+def field_signature(items):
+    return packed(sorted(items,key=lambda x:x['id']))
+
+
+def preserve_main_rivers(proposed,plan,ctx):
+    rows=ctx['catalog'].get('river',[])
+    areas={r[0]:r[4] for r in rows if len(r)>4}; peak=max(areas.values(),default=0)
+    # Retain dominant actual banks, not arbitrary width settings or minor rivers.
+    protected={x['id']:x for x in plan.get('rivers',[]) if peak>=100 and areas.get(x['id'],0)>=peak*.5 and x.get('banks','actual')=='actual'}
+    present={x['id'] for x in proposed.get('rivers',[])}
+    proposed['rivers']=[protected.get(x['id'],x) for x in proposed.get('rivers',[])]+[x for k,x in protected.items() if k not in present]
+    return proposed
+
+
 def next_revision(review,plan,ctx,metrics,images,required,stage):
-    proposed=review.get('next_plan')
-    if not isinstance(proposed,dict): proposed=plan
-    proposed=protect_airports(proposed,required)
-    # A high-density draft must receive an actual road reduction, not a rewritten reason
-    # or a redundant change to the fixed airport placement.
-    dense=metrics.get('road_fraction',0)>.06
-    if dense and road_load(proposed,ctx)>=road_load(plan,ctx)*.85 and len(plan.get('roads',[]))>1:
+    issues=review.get('issues',[])
+    text=' '.join(str(x) for x in issues).casefold()
+    net=metrics.get('connectivity',{}); dense=metrics.get('road_fraction',0)>.06
+    road_issue=any(re.search(r'road|street|arterial|traffic|도로',str(x),re.I) and re.search(r'dens|crowd|prun|excess|clutter|minor|redundan|촘촘|과도|밀도',str(x),re.I) for x in issues)
+    road_repair=dense or road_issue
+    river_repair=bool(net.get('rivers',{}).get('review_required')) or bool(re.search(r'river|tributar|stream|하천|지류',text))
+    proposed=review.get('next_plan'); proposed=protect_airports(proposed if isinstance(proposed,dict) else plan,required)
+    result=copy.deepcopy(plan)
+    for field,kind in [('roads','road'),('rivers','river')]:
+        rows=ctx['catalog'].get(kind,[])
+        candidate=checked_subset(proposed.get(field),rows,field)
+        if candidate is not None and (candidate or not plan.get(field)): result[field]=candidate
+    if road_repair and len(plan.get('roads',[]))>1 and road_load(result,ctx)>=road_load(plan,ctx)*.85:
         rows={r[0]:r for r in ctx['catalog']['road']}
         current=[rows[x['id']] for x in plan['roads'] if x['id'] in rows]
-        cap=max(1,int(len(current)*.65))
-        response=call(RULES+'\nThe rendered road network is too dense. This is a targeted road-only correction, not a full plan. Select at most '+str(cap)+' of the CURRENT road IDs to KEEP. Prioritize principal named corridors and important real river bridges, omit redundant parallel routes and minor roads. Every retained road will be one tile wide. Return {"keep_road_ids":["D1"],"reason":"..."}. '+packed({'city':ctx['city'],'fields':ctx['fields'],'current_roads':current,'road_fraction':metrics['road_fraction'],'issues':review.get('issues',[])}),images=images,stage=stage+'_road_subset_v1',max_tokens=2500)
-        # Preserve all non-road features, including the verified airport and river plan.
-        proposed=thin_roads(plan,ctx,response.get('keep_road_ids'))
-        return protect_airports(proposed,required)
-    if plan_signature(proposed)!=plan_signature(plan): return proposed
-    response=call(RULES+'\nThe previous review returned the SAME effective plan. Do not merely restate a diagnosis. Return a complete next_plan with concrete changes to feature IDs or widths (remove unnecessary roads/streams, preserve iconic river banks). Airport frame/selection is fixed to verified real position. If nothing can be corrected return {"next_plan":null}. '+SCHEMA+'\n'+packed({'catalog':ctx['catalog'],'issues':review.get('issues',[]),'plan':plan,'metrics':metrics}),images=images,stage=stage,max_tokens=7000)
+        ratio=.65 if dense else .80; cap=max(1,int(len(current)*ratio))
+        response=call(RULES+'\nTargeted road correction. Even below 6% the image review may identify local clutter. Select at most '+str(cap)+' CURRENT road IDs to KEEP, prioritizing real bridge routes and principal corridors. All retained roads will be one tile wide. Return {"keep_road_ids":["D1"],"reason":"..."}. '+packed({'city':ctx['city'],'fields':ctx['fields'],'current_roads':current,'road_fraction':metrics.get('road_fraction'),'issues':issues,'loss':metrics.get('feature_loss',{}).get('roads',[])}),images=images,stage=stage+'_road_subset_v2',max_tokens=2500)
+        thinned=thin_roads(plan,ctx,response.get('keep_road_ids'),ratio)
+        result['roads']=thinned['roads']; result['reason']=thinned['reason']
+    if river_repair and ctx['catalog'].get('river') and field_signature(result['rivers'])==field_signature(plan['rivers']):
+        rows=ctx['catalog']['river']; current=plan['rivers']
+        # Protect major mapped water surfaces; do not drop the iconic river to satisfy a metric.
+        area={r[0]:r[4] for r in rows if len(r)>4}; peak=max(area.values(),default=0)
+        protected={x['id']:x for x in current if peak>=100 and area.get(x['id'],0)>=peak*.5}
+        response=call(RULES+'\nTargeted river correction. Return only {"rivers":[{"id":"R1","width":1,"banks":"actual"}],"reason":"..."}. Use actual mapped connections, retain protected main rivers unchanged, omit minor disconnected tributaries or select actual connecting features; do not invent channels. Change at least one effective non-protected command if evidence supports it. If uncertain retain the current list. '+packed({'city':ctx['city'],'fields':ctx['fields'],'river_catalog':rows,'current_rivers':current,'protected_main_rivers':list(protected),'issues':issues,'connectivity':net.get('rivers',{}),'loss':metrics.get('feature_loss',{}).get('rivers',[])}),images=images,stage=stage+'_river_revision_v2',max_tokens=3000)
+        revised=checked_subset(response.get('rivers'),rows,'rivers')
+        if revised:
+            revised=[x for x in revised if x['id'] not in protected]+list(protected.values())
+            result['rivers']=revised
+    result=preserve_main_rivers(result,plan,ctx)
+    result=protect_airports(result,required)
+    if plan_signature(result)!=plan_signature(plan): return result
+    response=call(RULES+'\nThe review returned the SAME effective plan. Return a complete next_plan with concrete catalog ID or width changes. Preserve iconic rivers and fixed airports; if nothing can be corrected return {"next_plan":null}. '+SCHEMA+'\n'+packed({'catalog':ctx['catalog'],'issues':issues,'plan':plan,'metrics':metrics}),images=images,stage=stage+'_effective_v2',max_tokens=7000)
     nxt=response.get('next_plan')
     if not isinstance(nxt,dict): return None
+    for field,kind in [('roads','road'),('rivers','river')]:
+        checked=checked_subset(nxt.get(field),ctx['catalog'].get(kind,[]),field)
+        if checked is None or (not checked and plan.get(field)): return None
+        nxt[field]=checked
+    nxt=preserve_main_rivers(nxt,plan,ctx)
     nxt=protect_airports(nxt,required)
     return nxt if plan_signature(nxt)!=plan_signature(plan) else None
 
@@ -476,7 +550,7 @@ def run_city(city,km,out,rounds):
         grid,airports,ports,notes,errors,ref=b.build(frame,filtered,elev)
         image=png(grid); (folder/f'draft-{i+1}.png').write_bytes(image)
         counts={str(k):int(v) for k,v in collections.Counter(grid.ravel()).items()}
-        metrics={'connectivity':frame.network_stats,'changed_tiles':None if previous_grid is None else int(np.count_nonzero(grid!=previous_grid)),'road_fraction':round((counts.get(str(b.ROAD),0)+counts.get(str(b.ROAD_RIVER),0))/grid.size,5),'counts':counts,'airports':airports,'airport_details':frame.airport_details,'facility_relocations':frame.facility_relocations,'fallbacks':frame.facility_relocations,'unresolved':unresolved+frame.facility_unresolved,'notes':notes,'errors':errors}
+        metrics={'feature_loss':feature_loss(groups,plan,frame),'connectivity':frame.network_stats,'changed_tiles':None if previous_grid is None else int(np.count_nonzero(grid!=previous_grid)),'road_fraction':round((counts.get(str(b.ROAD),0)+counts.get(str(b.ROAD_RIVER),0))/grid.size,5),'counts':counts,'airports':airports,'airport_details':frame.airport_details,'facility_relocations':frame.facility_relocations,'fallbacks':frame.facility_relocations,'unresolved':unresolved+frame.facility_unresolved,'notes':notes,'errors':errors}
         previous_grid=grid.copy()
         if len(airports)!=len(frame.ai_airports): metrics['unresolved'].append('One or more planned airports could not be placed on land')
         # Save usable draft before review so a remote failure does not lose the map.
@@ -500,7 +574,7 @@ def run_city(city,km,out,rounds):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--codes',nargs='*'); p.add_argument('--km',type=float,default=25); p.add_argument('--limit',type=int,default=1); p.add_argument('--rounds',type=int,default=3); p.add_argument('--cities',type=Path,default=b.ROOT/'ctlist.html'); p.add_argument('--out',type=Path,default=b.ROOT/'generated_maps'); a=p.parse_args()
-    if not 1<=a.rounds<=3 or not 1<=a.limit<=10 or not 1<=a.km<=100: p.error('rounds 1–3, limit 1–10, km 1–100')
+    if not 1<=a.rounds<=5 or not 1<=a.limit<=10 or not 1<=a.km<=100: p.error('rounds 1–5, limit 1–10, km 1–100')
     a.out.mkdir(parents=True,exist_ok=True)
     if not os.getenv('GEMINI_API_KEY'): p.error('GEMINI_API_KEY secret missing')
     cities=b.load_cities(a.cities); chosen=[c for c in cities if not a.codes or str(c['code']) in a.codes]
