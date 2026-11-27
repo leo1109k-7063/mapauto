@@ -23,7 +23,20 @@ class TestPBF(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'Incomplete OSM references'): p.read_xml(path,[p.parse_selector(s) for s in p.SELECTORS])
     def test_filters(self):
         parsed=[p.parse_selector(s) for s in p.SELECTORS]
-        self.assertIn('w/highway=motorway,trunk,primary',p.filter_expressions(parsed))
+        # Connectivity repair uses real secondary roads and linking ramps.
+        # Check the complete whitelist, without depending on its ordering.
+        expected = {'motorway', 'trunk', 'primary', 'secondary',
+                    'motorway_link', 'trunk_link', 'primary_link', 'secondary_link'}
+        filters = [expr for expr in p.filter_expressions(parsed)
+                   if expr.startswith('w/highway=')]
+        self.assertEqual(len(filters), 1)
+        self.assertEqual(set(filters[0].split('=', 1)[1].split(',')), expected)
+        for kind in expected:
+            with self.subTest(highway=kind):
+                self.assertTrue(p.matches('way', {'highway': kind}, parsed))
+        for kind in ('tertiary', 'residential', 'service', 'footway', 'path'):
+            with self.subTest(excluded_highway=kind):
+                self.assertFalse(p.matches('way', {'highway': kind}, parsed))
         self.assertFalse(p.matches('node',{'harbour':'no'},parsed))
         self.assertTrue(p.matches('way',{'waterway':'stream'},parsed))
     def test_cached_pipeline(self):
