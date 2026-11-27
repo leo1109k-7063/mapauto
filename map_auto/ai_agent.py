@@ -253,12 +253,53 @@ def plan_signature(plan):
     return packed({k:sorted(plan.get(k,[]),key=lambda x:str(x.get('id'))) for k in ('rivers','roads','airports')})
 
 
+def road_load(plan,ctx):
+    """Approximate road workload, including OSM parallel carriageways in length."""
+    rows={r[0]:r for r in ctx['catalog']['road']}
+    return sum(rows[x['id']][3]*x['width'] for x in plan.get('roads',[]) if x['id'] in rows)
+
+
+def thin_roads(plan,ctx,keep_ids=None):
+    """Conservative fallback, using only already selected real road IDs.
+    AI can choose the subset; if it repeats a plan, rank by named class and length.
+    Connectivity is still enforced by the raster engine, not by this heuristic.
+    """
+    result=copy.deepcopy(plan)
+    rows={r[0]:r for r in ctx['catalog']['road']}
+    current=[x for x in result['roads'] if x['id'] in rows]
+    if len(current)<2: return result
+    cap=max(1,int(len(current)*.65))
+    def priority(x):
+        r=rows[x['id']]; classes=set(r[2]); tier=3 if classes & {'motorway','trunk'} else 2 if 'primary' in classes else 1
+        return (bool(r[1]),tier,r[3],r[0])
+    if isinstance(keep_ids,list) and all(isinstance(x,str) for x in keep_ids):
+        ids=set(keep_ids)
+        chosen=[x for x in current if x['id'] in ids]
+        if not 1<=len(chosen)<=cap or not ids<=set(x['id'] for x in current): chosen=[]
+    else: chosen=[]
+    method='AI selected subset' if chosen else 'automatic named-road priority fallback'
+    if not chosen: chosen=sorted(current,key=priority,reverse=True)[:cap]
+    result['roads']=[{'id':x['id'],'width':1} for x in chosen]
+    result['reason']=str(result.get('reason',''))+'\nRoad density repair: '+method+'; '+str(len(current))+' -> '+str(len(chosen))+' road IDs; recheck connectivity and image.'
+    return result
+
+
 def next_revision(review,plan,ctx,metrics,images,required,stage):
     proposed=review.get('next_plan')
     if not isinstance(proposed,dict): proposed=plan
     proposed=protect_airports(proposed,required)
+    # A high-density draft must receive an actual road reduction, not a rewritten reason
+    # or a redundant change to the fixed airport placement.
+    dense=metrics.get('road_fraction',0)>.06
+    if dense and road_load(proposed,ctx)>=road_load(plan,ctx)*.85 and len(plan.get('roads',[]))>1:
+        rows={r[0]:r for r in ctx['catalog']['road']}
+        current=[rows[x['id']] for x in plan['roads'] if x['id'] in rows]
+        cap=max(1,int(len(current)*.65))
+        response=call(RULES+'\nThe rendered road network is too dense. This is a targeted road-only correction, not a full plan. Select at most '+str(cap)+' of the CURRENT road IDs to KEEP. Prioritize principal named corridors and important real river bridges, omit redundant parallel routes and minor roads. Every retained road will be one tile wide. Return {"keep_road_ids":["D1"],"reason":"..."}. '+packed({'city':ctx['city'],'fields':ctx['fields'],'current_roads':current,'road_fraction':metrics['road_fraction'],'issues':review.get('issues',[])}),images=images,stage=stage+'_road_subset_v1',max_tokens=2500)
+        # Preserve all non-road features, including the verified airport and river plan.
+        proposed=thin_roads(plan,ctx,response.get('keep_road_ids'))
+        return protect_airports(proposed,required)
     if plan_signature(proposed)!=plan_signature(plan): return proposed
-    # Force concrete changes rather than spending another round rendering an identical plan.
     response=call(RULES+'\nThe previous review returned the SAME effective plan. Do not merely restate a diagnosis. Return a complete next_plan with concrete changes to feature IDs or widths (remove unnecessary roads/streams, preserve iconic river banks). Airport frame/selection is fixed to verified real position. If nothing can be corrected return {"next_plan":null}. '+SCHEMA+'\n'+packed({'catalog':ctx['catalog'],'issues':review.get('issues',[]),'plan':plan,'metrics':metrics}),images=images,stage=stage,max_tokens=7000)
     nxt=response.get('next_plan')
     if not isinstance(nxt,dict): return None
@@ -361,7 +402,7 @@ def plan_city(ctx,raw,folder,fixed_airports=None):
     for kind,field,schema in specs:
         evidence={**base,'catalog':ctx['catalog'][kind]}
         evidence.pop('airports',None)
-        guidance=('Prefer only named principal transport corridors; omit redundant parallel routes and minor arterials, mostly width 1, only exceptional major expressways width 2. A sparse network matters more than including every road.' if kind=='road' else 'Keep real iconic river banks; use narrow for secondary tributaries with mapped centerlines when actual banks would make them disproportionately wide. Omit minor streams and isolated artifacts.')
+        guidance=('Prefer only named principal transport corridors; omit redundant parallel routes and minor arterials, mostly width 1, only exceptional major expressways width 2. A sparse network matters more than including every road. As a starting point for a 25 km frame, aim for about 25–45 named principal corridors (fewer in smaller cities), not 100+ road IDs; use width 1 by default and reserve width 2 for exceptional corridors. Preserve real bridge routes. This is a guide, not a city-specific hard limit.' if kind=='road' else 'Keep real iconic river banks; use narrow for secondary tributaries with mapped centerlines when actual banks would make them disproportionately wide. Omit minor streams and isolated artifacts.')
         result=call(RULES+'\nSelect only '+kind+' features from supplied catalog; use research and geometry, not fixed city rules. '+guidance+' Return JSON '+schema+'\n'+packed(evidence),images=[raw],stage='plan_'+kind,max_tokens=4096)
         if not isinstance(result.get(field),list): raise GeminiError('plan_'+kind,'missing '+field+' list')
         results[field]=result[field]; reasons.append(str(result.get('reason','')))
@@ -444,7 +485,7 @@ def run_city(city,km,out,rounds):
         if not errors: b.save(out,city,grid,provisional)
         review=call(RULES+'\nCompare image 1 raw OSM reference (not independent satellite) and image 2 game map, plus research. Check river width, tributaries, water artifacts, road density, airport and port connections. Check connectivity metrics: roads must be a single connected network; rivers must be logically connected under dark-yellow road crossings (code 81 counts as both road and river). If significant disconnected selected features were excluded, revise using other real catalog IDs; do not approve solely because the remaining network is connected. Center is fixed. Evidence-authorized peripheral facilities may be relocated up to 7 km from actual location; compare relocation report, not exact original position alone. If road density excessive, remove concrete road IDs (rather than repeat the same selection). If changed_tiles is zero, previous revision had no visual effect; propose genuinely different IDs or widths. No sea means no sea port required. Return JSON {"approved":true or false,"issues":["..."],"next_plan":{...}}. If false supply complete revised plan using schema: '+SCHEMA+'\n'+evidence+'\nCurrent plan/metrics: '+packed({'plan':plan,'metrics':metrics}),images=[reduced,image],stage=f"review_{i+1}",max_tokens=8192)
         history.append({'plan':plan,'metrics':metrics,'review':review}); (folder/'history.json').write_text(json.dumps(history,ensure_ascii=False,indent=2))
-        approved=review.get('approved') is True and not (set(center_report['omitted']) & set(center_report['accepted_landmarks'])) and not any(frame.network_stats[k]['review_required'] for k in ('roads','rivers')) and not errors and not metrics['unresolved'] and not frame.facility_unresolved and not any('고도 자료 없음' in n or '해안선이 닫히지' in n or '항구/부두 배치 실패' in n for n in notes)
+        approved=review.get('approved') is True and metrics['road_fraction']<=.06 and not (set(center_report['omitted']) & set(center_report['accepted_landmarks'])) and not any(frame.network_stats[k]['review_required'] for k in ('roads','rivers')) and not errors and not metrics['unresolved'] and not frame.facility_unresolved and not any('고도 자료 없음' in n or '해안선이 닫히지' in n or '항구/부두 배치 실패' in n for n in notes)
         report={'city':city,'center':[lat,lon],'center_policy':{k:center_report[k] for k in ('original_center','final_center','shift_km','omitted')},'km':frame.km,'tile_m':frame.m,'tile_px':32,'model':ACTIVE_MODEL or MODEL,'model_trace':list(MODEL_TRACE),'river_under_road':np.flatnonzero(frame.river_crossings.ravel()).tolist(),'status':'AI_APPROVED' if approved else 'REVIEW_REQUIRED','round':i+1,'metrics':metrics,'review':review,'sources':['OpenStreetMap contributors','AWS Terrain Tiles','Wikipedia contributors (see research.json for links)']}
         if not errors: b.save(out,city,grid,report)
         else: (folder/f'round-{i+1}.error.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
