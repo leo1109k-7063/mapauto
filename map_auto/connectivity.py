@@ -22,7 +22,7 @@ def orthogonalize(mask,allowed):
         v[y[top],x[top]+1]=True; v[y[bottom]+1,x[bottom]]=True
     return m
 
-def connected_network(selected,corridor,allowed):
+def connected_network(selected,corridor,allowed,preserve=False):
     """Keep selected features connected to largest selected component, using real corridor cells.
     Unreachable components are explicitly reported; no straight invented roads/rivers.
     Added paths are one tile wide and prefer existing selected tiles.
@@ -62,7 +62,8 @@ def connected_network(selected,corridor,allowed):
                 ndist=d+(1 if chosen[j] else 5)
                 if ndist<dist[j]:
                     dist[j]=ndist; parent[j]=i; heapq.heappush(heap,(ndist,j))
+    if preserve: result|=missing
     _,after,_=components(result); _,lost_n,lost_sizes=components(missing)
     removed=int((original&~result).sum()); added=int((result&~original).sum()); total=int(original.sum())
     biggest=int(lost_sizes.max()) if lost_n else 0
-    return result,{'before_components':int(components(original)[1]),'after_components':int(after),'added_tiles':added,'removed_tiles':removed,'unreachable_components':int(lost_n),'largest_removed_component':biggest,'selected_tiles':total,'review_required':bool(removed and (biggest>=40 or removed>=max(10,total*.05)))}
+    return result,{'before_components':int(components(original)[1]),'after_components':int(after),'added_tiles':added,'removed_tiles':removed,'unreachable_components':int(lost_n),'largest_removed_component':biggest,'selected_tiles':total,'review_required':bool((preserve and after>1) or (removed and (biggest>=40 or removed>=max(10,total*.05))))}

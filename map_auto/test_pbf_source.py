@@ -29,8 +29,10 @@ class TestPBF(unittest.TestCase):
                     'motorway_link', 'trunk_link', 'primary_link', 'secondary_link'}
         filters = [expr for expr in p.filter_expressions(parsed)
                    if expr.startswith('w/highway=')]
-        self.assertEqual(len(filters), 1)
-        self.assertEqual(set(filters[0].split('=', 1)[1].split(',')), expected)
+        self.assertEqual(len(filters), 2)
+        self.assertEqual(set().union(*(set(x.split('=',1)[1].split(',')) for x in filters)), expected | {'tertiary','unclassified','residential'})
+        self.assertTrue(p.matches('way', {'highway':'tertiary','name':'A'},parsed))
+        self.assertTrue(p.matches('way', {'highway':'residential','name':'A'},parsed))
         for kind in expected:
             with self.subTest(highway=kind):
                 self.assertTrue(p.matches('way', {'highway': kind}, parsed))

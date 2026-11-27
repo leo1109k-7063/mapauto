@@ -12,6 +12,7 @@ SELECTORS=[
  'nwr[natural=water][water~"^(river|canal|sea)$"]','nwr[waterway=riverbank]',
  'way[waterway~"^(river|stream|canal)$"]',
  'way[highway~"^(motorway|trunk|primary|secondary|motorway_link|trunk_link|primary_link|secondary_link)$"]',
+ 'way[highway~"^(tertiary|unclassified|residential)$"][name]',
  'nwr[aeroway=aerodrome]','way[aeroway=runway]',
  'nwr[harbour][harbour!=no]','nwr[landuse=port]','nwr[industrial=port]',
  'nwr[amenity=ferry_terminal]','nwr[man_made=pier]','nwr[man_made=quay]']
