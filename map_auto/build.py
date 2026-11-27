@@ -15,8 +15,8 @@ from shapely.geometry import Point, LineString, Polygon, box
 from shapely.ops import unary_union, polygonize
 from shapely import make_valid
 
-N=500; LAND,SEA,RIVER,MOUNTAIN,PORT,AIRPORT,ROAD,PIER,ROAD_RIVER=0,1,2,3,5,6,8,51,81
-COLORS={0:'#4CAF50',1:'#1A237E',2:'#00BCD4',3:'#1B5E20',4:'#FFFFFF',5:'#BDBDBD',6:'#424242',8:'#FFFF00',51:'#795548',81:'#B8860B'}
+N=500; LAND,SEA,RIVER,MOUNTAIN,PORT,AIRPORT,ROAD,PIER,ROAD_RIVER,ROAD_TUNNEL=0,1,2,3,5,6,8,51,81,82
+COLORS={0:'#4CAF50',1:'#1A237E',2:'#00BCD4',3:'#1B5E20',4:'#FFFFFF',5:'#BDBDBD',6:'#424242',8:'#FFFF00',51:'#795548',81:'#B8860B',82:'#FFA500'}
 ROOT=Path(__file__).resolve().parents[1]; CACHE=ROOT/'.map-cache'; CACHE.mkdir(exist_ok=True)
 SESSION=requests.Session(); SESSION.headers['User-Agent']='mapaditer-game-map/1.0 (https://github.com/leo1109k-7063/mapaditer)'
 CROSS=nd.generate_binary_structure(2,1)
@@ -378,7 +378,7 @@ def port(grid,center,piergeom,notes):
     grid[pm]=PIER; return True
 
 def validate(grid,airports):
-    errors=[]; allowed={LAND,SEA,RIVER,MOUNTAIN,PORT,AIRPORT,ROAD,PIER,ROAD_RIVER}
+    errors=[]; allowed={LAND,SEA,RIVER,MOUNTAIN,PORT,AIRPORT,ROAD,PIER,ROAD_RIVER,ROAD_TUNNEL}
     if grid.shape!=(N,N) or not set(np.unique(grid)).issubset(allowed): errors.append('크기 또는 타일 코드 오류')
     for tile,other in ((PORT,PIER),(PIER,PORT)):
         lab,n=nd.label(grid==tile,structure=CROSS)
@@ -387,7 +387,7 @@ def validate(grid,airports):
             if not (adj & (grid==other)).any(): errors.append(f'{tile} 연결 오류')
             if tile==PIER and not (adj & (grid==SEA)).any(): errors.append('부두 해상 공간 없음')
             if tile==PORT:
-                if not (adj & np.isin(grid,[LAND,ROAD,ROAD_RIVER])).any(): errors.append('항구 육지 연결 오류')
+                if not (adj & np.isin(grid,[LAND,ROAD,ROAD_RIVER,ROAD_TUNNEL])).any(): errors.append('항구 육지 연결 오류')
                 if not any(nd.binary_erosion(m,structure=np.ones(shape,bool)).any() for shape in [(2,4),(4,2)]): errors.append('터미널 부지 부족')
     a=grid==AIRPORT; count=0
     for x,y,w,h in airports:
@@ -487,11 +487,14 @@ def build(frame,elements,elev):
             ports.append(q); frame.facility_relocations.append(relocation_record(frame,name,'port',source,q))
     # Road wins on a real river crossing, but not on sea, mountains or facility tiles.
     road_land=grid==LAND
-    roads,crossings,road_stats,road_missing=rp.layout(objects,source_objects,water,road_land,line_mask,frame)
+    roads,crossings,road_stats,road_missing=rp.layout(objects,source_objects,water,road_land,line_mask,frame,tunnel_allowed=np.isin(grid,[LAND,RIVER,MOUNTAIN,SEA]))
     frame.network_removed['road']=road_missing
     grid[roads]=ROAD
     grid[crossings]=ROAD_RIVER
-    frame.network_stats={'roads':road_stats,'rivers':river_stats,'road_over_river_tiles':int(crossings.sum()),'logical_river_components':int(components(np.isin(grid,[RIVER,ROAD_RIVER])|hidden)[1]),'visible_road_components':int(components(np.isin(grid,[ROAD,ROAD_RIVER]))[1]),'hidden_river_tiles':int(hidden.sum())}
+    tunnels=frame.road_tunnels
+    grid[tunnels]=ROAD_TUNNEL
+    frame.tunnel_underlying={str(int(i)):int(original_terrain.ravel()[i]) for i in np.flatnonzero(tunnels.ravel())}
+    frame.network_stats={'roads':road_stats,'rivers':river_stats,'road_over_river_tiles':int(crossings.sum()),'road_tunnel_tiles':int(tunnels.sum()),'logical_river_components':int(components(np.isin(grid,[RIVER,ROAD_RIVER])|hidden|(tunnels&water))[1]),'visible_road_components':int(components(np.isin(grid,[ROAD,ROAD_RIVER,ROAD_TUNNEL]))[1]),'hidden_river_tiles':int(hidden.sum())}
     frame.river_crossings=crossings
     errors=validate(grid,airports)
     if frame.network_stats['visible_road_components']>1: notes.append('도로망 연결 미완료: 선택한 도로 보존, AI 재검토 필요')
@@ -501,18 +504,18 @@ def build(frame,elements,elev):
         if stats['added_tiles']: notes.append(f'{name}: 실제 지도 경로 및 대각선 보정으로 {stats["added_tiles"]}칸 연결')
     # Compare against terrain derived directly from the source before gameplay simplification.
     # A pier is the only permitted change to sea; rivers and mountains must remain intact.
-    invalid_water=((original_terrain==SEA)&~np.isin(grid,[SEA,PIER]))|((original_terrain==RIVER)&~np.isin(grid,[RIVER,ROAD_RIVER]))
+    invalid_water=((original_terrain==SEA)&~np.isin(grid,[SEA,PIER,ROAD_TUNNEL]))|((original_terrain==RIVER)&~np.isin(grid,[RIVER,ROAD_RIVER,ROAD_TUNNEL]))
     if invalid_water.any(): errors.append('원자료 수역과 불일치')
-    if ((original_terrain==MOUNTAIN)&(grid!=MOUNTAIN)).any(): errors.append('원자료 산지와 불일치')
+    if ((original_terrain==MOUNTAIN)&(grid!=MOUNTAIN)&~tunnels).any(): errors.append('원자료 산지와 불일치')
     land=grid==LAND; labels,n=nd.label(land,structure=CROSS); sizes=np.bincount(labels.ravel()); largest=int(sizes[1:].max()) if n else 0
     if land.sum()<N*N*.12 or largest<2500: notes.append('건축용 연결 평지 부족 가능성: 맵 범위/산 기준 검토')
-    notes.append('실제 횡단 교량만 81; 하천변/고가도로는 육지로 조정; 복개 구간은 논리적 수계에만 포함')
+    notes.append('실제 횡단 교량만 81; 실제 도로 터널은 82; 하천변/고가도로는 육지로 조정; 복개 구간은 논리적 수계에만 포함')
     return grid,airports,len(ports),notes,errors,original_terrain
 
 def save(out,city,grid,report):
-    report=dict(report); report['river_under_road']=np.flatnonzero(grid.ravel()==ROAD_RIVER).tolist()
+    report=dict(report); report['road_tunnel_tiles']=np.flatnonzero(grid.ravel()==ROAD_TUNNEL).tolist(); report['river_under_road']=np.flatnonzero(grid.ravel()==ROAD_RIVER).tolist()
     out.mkdir(parents=True,exist_ok=True); name=str(city['code']); colors=json.dumps(COLORS); data=','.join(map(str,grid.ravel())); safe=json.dumps(city['name'],ensure_ascii=False).replace('<','\\u003c')
-    html=f'''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>500×500 city map</title><style>body{{margin:0;background:#111;color:#ddd;text-align:center;font:14px sans-serif}}canvas{{width:min(94vw,85vh);height:auto;image-rendering:pixelated}}</style><h2 id="name"></h2><canvas id="mapCanvas" width="500" height="500"></canvas><p>© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · <a href="https://registry.opendata.aws/terrain-tiles/">AWS Terrain Tiles / elevation sources</a></p><script>const gridData = new Uint8Array([{data}]);const colors={colors};const tileCodes={{51:'5-1',8:'8',81:'81'}};const riverUnderRoad={json.dumps(report.get('river_under_road',[]),separators=(',',':'))};const hiddenRiverTiles={json.dumps(report.get('hidden_river_tiles',[]),separators=(',',':'))};document.getElementById('name').textContent={safe};const ctx=document.getElementById('mapCanvas').getContext('2d');for(let i=0;i<gridData.length;i++){{ctx.fillStyle=colors[gridData[i]];ctx.fillRect(i%500,Math.floor(i/500),1,1);}}</script></html>'''
+    html=f'''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>500×500 city map</title><style>body{{margin:0;background:#111;color:#ddd;text-align:center;font:14px sans-serif}}canvas{{width:min(94vw,85vh);height:auto;image-rendering:pixelated}}</style><h2 id="name"></h2><canvas id="mapCanvas" width="500" height="500"></canvas><p>© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · <a href="https://registry.opendata.aws/terrain-tiles/">AWS Terrain Tiles / elevation sources</a></p><script>const gridData = new Uint8Array([{data}]);const colors={colors};const tileCodes={{51:'5-1',8:'8',81:'81',82:'82'}};const tunnelUnderlying={json.dumps(report.get('tunnel_underlying',{}),separators=(',',':'))};const riverUnderRoad={json.dumps(report.get('river_under_road',[]),separators=(',',':'))};const hiddenRiverTiles={json.dumps(report.get('hidden_river_tiles',[]),separators=(',',':'))};document.getElementById('name').textContent={safe};const ctx=document.getElementById('mapCanvas').getContext('2d');for(let i=0;i<gridData.length;i++){{ctx.fillStyle=colors[gridData[i]];ctx.fillRect(i%500,Math.floor(i/500),1,1);}}</script></html>'''
     (out/(name+'.html')).write_text(html,encoding='utf-8'); (out/(name+'.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     palette=np.zeros((256,3),np.uint8)
     for k,v in COLORS.items(): palette[k]=[int(v[i:i+2],16) for i in (1,3,5)]
@@ -582,7 +585,7 @@ def main():
                 if not a.allow_no_dem: raise
                 elev=None
             grid,airports,ports,notes,errors,reference=build(frame,elements,elev)
-            report={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'orientation':'north-up','counts':{str(k):int(v) for k,v in Counter(grid.ravel()).items()},'airports':airports,'airport_details':frame.airport_details,'connectivity':frame.network_stats,'river_under_road':np.flatnonzero(frame.river_crossings.ravel()).tolist(),'hidden_river_tiles':np.flatnonzero(frame.hidden_rivers.ravel()).tolist(),'generator_version':'2.1','ports':ports,'status':'REVIEW_REQUIRED' if notes or errors else 'STRUCTURE_OK','structural_errors':errors,'notes':notes,'sources':['OpenStreetMap contributors (ODbL)','AWS Terrain Tiles (see source attribution)'],'geographic_validation':'Source terrain checked for sea/river/mountain changes; independent map or human review still needed','comparison_image':'left: source-derived terrain; right: game map'}
+            report={'city':city,'center':[lat,lon],'km':frame.km,'tile_m':frame.m,'tile_px':32,'orientation':'north-up','counts':{str(k):int(v) for k,v in Counter(grid.ravel()).items()},'airports':airports,'airport_details':frame.airport_details,'connectivity':frame.network_stats,'river_under_road':np.flatnonzero(frame.river_crossings.ravel()).tolist(),'hidden_river_tiles':np.flatnonzero(frame.hidden_rivers.ravel()).tolist(),'tunnel_underlying':frame.tunnel_underlying,'generator_version':'2.2','ports':ports,'status':'REVIEW_REQUIRED' if notes or errors else 'STRUCTURE_OK','structural_errors':errors,'notes':notes,'sources':['OpenStreetMap contributors (ODbL)','AWS Terrain Tiles (see source attribution)'],'geographic_validation':'Source terrain checked for sea/river/mountain changes; independent map or human review still needed','comparison_image':'left: source-derived terrain; right: game map'}
             if errors: raise RuntimeError('; '.join(errors))
             save(a.out,city,grid,report)
             palette=np.zeros((256,3),np.uint8)

@@ -12,11 +12,14 @@ LINKS={x+'_link' for x in BASE}
 EXTENSIONS={'tertiary','unclassified','residential'}
 
 def name_key(t):
-    s=t.get('name:ko') or t.get('name') or t.get('name:en') or t.get('ref') or ''
+    s=t.get('_route_name') or t.get('name:ko') or t.get('name') or t.get('name:en') or t.get('ref') or ''
     return re.sub(r'\s+', '', unicodedata.normalize('NFKC',str(s)).casefold())
 
 def is_covered(t):
     return (str(t.get('tunnel','no')).lower() not in ('no','false','0','') or t.get('location')=='underground' or t.get('covered') in ('yes','true','1') or t.get('waterway')=='culvert')
+
+def is_road_tunnel(t):
+    return bool(t.get("highway")) and (str(t.get("tunnel", "no")).lower() not in ("no","false","0","","culvert","building_passage") or t.get("location")=="underground")
 
 def is_bridge(t):
     return str(t.get('bridge','no')).lower() not in ('no','false','0','') and not is_covered(t)
@@ -25,6 +28,45 @@ def lines(g):
     if g.geom_type in ('LineString','LinearRing'): yield g
     elif hasattr(g,'geoms'):
         for p in g.geoms: yield from lines(p)
+
+def associate_tunnels(elements,geometry):
+    """Join differently named tunnel segments to the same surface corridor only
+    when exact shared geometry endpoints at both mouths identify it unambiguously.
+    Do not guess from proximity or a shared highway number alone.
+    """
+    surface=defaultdict(set); names={}; tunnels=[]; endpoint_index=defaultdict(list)
+    def ends(g):
+        return {tuple(round(float(v),4) for v in p[:2]) for l in lines(g) for p in (l.coords[0],l.coords[-1])}
+    for e in elements:
+        t=e.get('tags',{}); k=t.get('highway'); name=name_key(t)
+        if k not in BASE|EXTENSIONS|LINKS or k in LINKS: continue
+        g=geometry(e)
+        if g is None or g.is_empty: continue
+        pts=ends(g)
+        if is_road_tunnel(t):
+            i=len(tunnels); tunnels.append((e,pts))
+            for pt in pts: endpoint_index[pt].append(i)
+        elif name:
+            names[name]=t.get('name:ko') or t.get('name') or t.get('name:en') or t.get('ref')
+            for pt in pts: surface[pt].add(name)
+    seen=set(); aliases={}
+    for i in range(len(tunnels)):
+        if i in seen: continue
+        stack=[i]; seen.add(i); group=[]; contacts={}
+        while stack:
+            j=stack.pop(); group.append(j)
+            for pt in tunnels[j][1]:
+                if pt in surface: contacts[pt]=surface[pt]
+                for q in endpoint_index[pt]:
+                    if q not in seen: seen.add(q); stack.append(q)
+        if len(contacts)<2: continue
+        candidates=set.intersection(*contacts.values())
+        if len(candidates)!=1: continue
+        key=next(iter(candidates))
+        for j in group:
+            e,_=tunnels[j]; aliases[(e['type'],e['id'])]=names[key]
+    return aliases
+
 
 def bridge_cells(g,t,water,raster,wet_geom=None):
     """An explicit bridge must span water transversely, not run along it.
@@ -105,52 +147,123 @@ def merge_parallel(route,land,bridge):
     uncovered=dry&~nd.binary_dilation(thin,structure=np.ones((3,3),bool))
     return thin|uncovered
 
-def layout(objects,source,water,land,raster,frame):
-    """Road IDs remain whole; only unnamed/selected-name ramps supply short connectors.
-    Any remaining disconnection is retained and explicitly reported rather than erased.
+def prune_spurs(route, protected, max_length=8):
+    """Remove only short terminal branches ending at a junction of the same corridor.
+    Keep genuine isolated/linear routes, boundary exits and bridges/tunnels.
     """
+    result=route.copy(); protected=protected.copy()
+    protected[[0,-1],:]=True; protected[:,[0,-1]]=True
+    h,w=route.shape
+    def neighbors(y,x):
+        return [(a,b) for a,b in ((y-1,x),(y+1,x),(y,x-1),(y,x+1)) if 0<=a<h and 0<=b<w and result[a,b]]
+    for _ in range(3):
+        degree=nd.convolve(result.astype(np.uint8),CROSS.astype(np.uint8),mode='constant')-result
+        removed=0
+        for y,x in zip(*np.where(result & (degree==1) & ~protected)):
+            if not result[y,x]: continue
+            chain=[(y,x)]; prev=None; cur=(y,x)
+            while len(chain)<=max_length:
+                ns=[q for q in neighbors(*cur) if q!=prev]
+                if len(ns)!=1: break
+                nxt=ns[0]; deg=len(neighbors(*nxt))
+                if deg>=3:
+                    if not any(protected[q] for q in chain):
+                        for q in chain: result[q]=False
+                        removed+=len(chain)
+                    break
+                if deg<=1 or protected[nxt]: break
+                chain.append(nxt); prev,cur=cur,nxt
+        if not removed: break
+    return result
+
+
+def simplify_route(route,land,protected):
+    """Collapse nearby carriageways and small interchange loops, not long distinct sections."""
+    # Closing bridges small raster gaps; restrict to actual dry land and keep tunnel/bridge cells.
+    # Fill small enclosed gaps between carriageways (including irregular 1–3 cell gaps).
+    dry=route&land&~protected
+    filled=dry.copy()
+    for dy,dx in ((0,1),(1,0),(1,1),(1,-1)):
+        for distance in (2,3,4):
+            a=np.roll(dry,(dy,dx),(0,1)); z=np.roll(dry,(-(distance-1)*dy,-(distance-1)*dx),(0,1)); gap=a&z&land
+            gap[:4,:]=False; gap[-4:,:]=False; gap[:,:4]=False; gap[:,-4:]=False
+            for k in range(distance-1):
+                filled|=np.roll(gap,(k*dy,k*dx),(0,1))&land
+    # Only fill tiny enclosed holes; large loops remain real geography.
+    holes=nd.binary_fill_holes(filled)&~filled&land
+    labels,n,sizes=components(holes)
+    filled|=holes & (sizes[labels]<=20)
+    if np.array_equal(filled,dry): return route
+    thin=skeletonize(filled)
+    near=nd.binary_dilation(protected,structure=CROSS,iterations=2)
+    thin=(thin&~near)|(dry&near)|protected
+    # Preserve frame exits and any genuine portions not represented by the centerline.
+    edges=np.zeros_like(dry); edges[[0,-1],:]=True; edges[:,[0,-1]]=True
+    uncovered=dry & ~nd.binary_dilation(thin,structure=np.ones((3,3),bool),iterations=2)
+    return thin|uncovered|(dry&edges)
+
+
+def layout(objects,source,water,land,raster,frame,tunnel_allowed=None):
+    """Full named corridors, simplified centerlines and only necessary ramp connectors."""
     groups=defaultdict(list)
+    if tunnel_allowed is None: tunnel_allowed=land|water
     for t,g,i in objects:
         k=t.get('highway'); name=name_key(t)
         if k not in BASE|LINKS|EXTENSIONS or (k in LINKS|EXTENSIONS and not name): continue
         if k in EXTENSIONS and t.get('_ai_width') is None: continue
         if g.geom_type not in ('LineString','MultiLineString'): continue
         groups[name or f'way/{i}'].append((t,g,i))
-    selected=np.zeros_like(water); bridge=np.zeros_like(water); corridor=np.zeros_like(water)
+    selected=np.zeros_like(water); bridge=np.zeros_like(water); tunnel=np.zeros_like(water); corridor=np.zeros_like(water)
     details=[]; missing=np.zeros_like(water); nearest=nd.distance_transform_edt(~land,return_indices=True); land_distance=nearest[0]
+    # Build independent route masks first so true junctions with other selected roads are protected.
+    records=[]; overlap=np.zeros_like(water,dtype=np.uint16)
     for key,parts in groups.items():
-        route=np.zeros_like(water); raw_all=np.zeros_like(water); route_bridge=np.zeros_like(water); route_width=1
+        route=np.zeros_like(water); raw_all=np.zeros_like(water); route_bridge=np.zeros_like(water); route_tunnel=np.zeros_like(water); ramp=np.zeros_like(water); ramp_bridge=np.zeros_like(water); ramp_tunnel=np.zeros_like(water); route_width=1
+        has_main=any(t.get('highway') not in LINKS for t,g,i in parts)
         for t,g,i in parts:
             width=int(t.get('_ai_width',1)); route_width=max(route_width,width)
-            raw=raster(g); raw_all|=raw
-            true=bridge_cells(g,t,water,raster,None); route_bridge|=true
-            route|=shift_to_land(raw&(land|water),land,true,nearest=nearest)
-        # A small join consolidates separated carriageways/ramps within a route.
-        allowed=land|route_bridge
-        if len(parts)>1: route=merge_parallel(route,land,route_bridge)
+            raw=raster(g.simplify(.6,preserve_topology=True)); is_ramp=has_main and t.get('highway') in LINKS
+            if not is_ramp: raw_all|=raw
+            if is_road_tunnel(t):
+                line=orthogonalize(raw,tunnel_allowed); true=np.zeros_like(water); tun=line
+            else:
+                true=bridge_cells(g,t,water,raster,None); line=shift_to_land(raw&(land|water),land,true,nearest=nearest)|true; tun=np.zeros_like(water)
+            if is_ramp: ramp|=line; ramp_bridge|=true; ramp_tunnel|=tun
+            else: route|=line; route_bridge|=true; route_tunnel|=tun
+        overlap+=route
+        records.append((key,parts,route,raw_all,route_bridge,route_tunnel,ramp,ramp_bridge,ramp_tunnel,route_width))
+    for key,parts,route,raw_all,route_bridge,route_tunnel,ramp,ramp_bridge,ramp_tunnel,route_width in records:
+        original=route.copy(); allowed=land|route_bridge|route_tunnel|ramp_bridge|ramp_tunnel
+        protected=route_bridge|route_tunnel
+        # Prune original short branches before closing can distort their junction.
+        junction=nd.binary_dilation((overlap>0)&~original,structure=CROSS)| (overlap>1)
         route=orthogonalize(route,allowed)
-        local=local_join(route,land)|route_bridge
-        # Connect selected pieces but do not discard ones that cannot safely join.
+        before=int(route.sum()); route=prune_spurs(route,protected|junction,max_length=8)
+        pruned=before-int(route.sum())
+        if len(parts)>1: route=simplify_route(route,land,protected)
+        route=orthogonalize(route,allowed)
+        before=int(route.sum()); route=prune_spurs(route,protected|junction,max_length=8)
+        pruned+=before-int(route.sum())
+        local=local_join(route,land)|route_bridge|route_tunnel|ramp
         merged,stat=connected_network(route,local,allowed,preserve=True)
         if route_width>1:
-            # Width must not manufacture extra bridge cells or eat into riverbanks.
-            merged|=nd.binary_dilation(merged,structure=CROSS)&land&nd.binary_dilation(route,structure=CROSS)
-        selected|=merged; bridge|=route_bridge; corridor|=local
-        lost=raw_all&~(land|water); missing|=lost
-        details.append({'name':str(parts[0][0].get('name') or parts[0][0].get('name:ko') or key),'source_segments':len(parts),'route_components':int(components(merged)[1]),'unplaced_nonwater_tiles':int(lost.sum()),'unplaced_water_tiles':int((raw_all&water&~route_bridge&(land_distance>8)).sum()),'bridge_tiles':int(route_bridge.sum())})
-    # Use genuine ramps only, rather than re-adding arbitrary fragments of deleted named roads.
+            # A two-cell strip, rather than the former three-cell cross dilation.
+            merged|=nd.binary_dilation(merged,structure=np.ones((2,2),bool))&land&nd.binary_dilation(route,structure=np.ones((2,2),bool))&~route_tunnel
+        selected|=merged; bridge|=route_bridge|ramp_bridge; tunnel|=route_tunnel|ramp_tunnel; corridor|=local
+        lost=raw_all&~(land|water|route_tunnel); missing|=lost
+        details.append({'name':str(parts[0][0].get('name') or parts[0][0].get('name:ko') or key),'source_segments':len(parts),'route_components':int(components(merged)[1]),'unplaced_nonwater_tiles':int(lost.sum()),'unplaced_water_tiles':int((raw_all&water&~(route_bridge|route_tunnel)&(land_distance>8)).sum()),'bridge_tiles':int((merged&route_bridge).sum()),'tunnel_tiles':int((merged&route_tunnel).sum()),'pruned_spur_tiles':pruned,'optional_ramp_tiles':int(ramp.sum())})
     for t,g,i in source:
         k=t.get('highway'); name=name_key(t)
         if k not in LINKS or (name and name not in groups): continue
-        raw=raster(g); true=bridge_cells(g,t,water,raster,None)
-        bridge|=true; corridor|=orthogonalize(shift_to_land(raw&(land|water),land,true,nearest=nearest),land|true)
-    allowed=land|bridge
-    # Small inter-route gap correction only where selected routes meet/approach on land.
+        raw=raster(g.simplify(.6,preserve_topology=True))
+        if is_road_tunnel(t):
+            tun=orthogonalize(raw,tunnel_allowed); tunnel|=tun; corridor|=tun
+        else:
+            true=bridge_cells(g,t,water,raster,None); bridge|=true; corridor|=orthogonalize(shift_to_land(raw&(land|water),land,true,nearest=nearest)|true,land|true)
+    allowed=land|bridge|tunnel
     corridor|=local_join(selected,land,max_gap=1)
     roads,stats=connected_network(selected,corridor,allowed,preserve=True)
-    # Preserve selected full routes. Unresolved fragments must never earn approval.
     stats['review_required']=bool(stats['review_required'] or any(d['unplaced_nonwater_tiles']>=3 or d['unplaced_water_tiles']>=3 for d in details))
-    stats['named_routes']=details
-    stats['route_count']=len(details)
-    stats['unplaced_source_tiles']=int(missing.sum())
-    return roads,roads&water&bridge,stats,missing
+    stats['named_routes']=details; stats['route_count']=len(details); stats['unplaced_source_tiles']=int(missing.sum()); stats['pruned_spur_tiles']=sum(d['pruned_spur_tiles'] for d in details)
+    frame.road_tunnels=roads&tunnel
+    return roads,roads&water&bridge&~frame.road_tunnels,stats,missing
